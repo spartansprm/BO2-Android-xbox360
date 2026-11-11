@@ -166,58 +166,6 @@ escenario.
 
 ---
 
-## Compilar
-
-El entorno es Linux x86-64 o WSL2 con Ubuntu 24.04:
-
-```bash
-sudo apt install git g++-14 openjdk-21-jdk python3-venv unzip libx11-xcb1 libx11-6 libxcb1 libwayland-client0
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements-build.txt
-
-sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
-export ANDROID_HOME="$HOME/Android/Sdk"
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
-```
-
-Pon los cuatro ejecutables en una carpeta y lanza:
-
-```bash
-./build.sh --inputs /ruta/entradas --jobs 4
-```
-
-Sale `dist/BO2-v0.55.0.apk`. También acepta los ZIP del extractor:
-
-```bash
-./build.sh --inputs /ruta/multijugador.zip --campaign-inputs /ruta/campana.zip
-```
-
-Solo Zombies y Multijugador: `--program mp`. Comprobar las herramientas instaladas: `./build.sh --stage check`.
-
-La primera compilación descarga las dependencias públicas, genera el código, compila el SDK y los dos programas, y
-puede tardar varias horas. Necesita conexión a internet, ~16 GB libres y 8 GB de RAM; ajusta `--jobs` según la
-memoria.
-
-Cada copia del proyecto genera su propia clave de firma en `work/signing/`. Consérvala para poder actualizar tus
-compilaciones, y no la publiques.
-
-**El APK que obtienes contiene el código del juego recompilado desde tus archivos: es para ti.** Comparte el código
-fuente y tus mejoras, nunca el APK ni los archivos del juego.
-
----
-
-## Modificar
-
-El lanzador y los controles están en `android/app/src/main/`, el renderizador en `app/src/native/render/`, la
-integración nativa en `android/game/` y el SDK en `sdk/`. Tras editar, se recompila con el mismo comando.
-
-Las mejoras de rendimiento son el frente más abierto: el renderizador emula la EDRAM de la Xbox 360 con imágenes
-normales, y en una GPU de tiles eso significa mover muchos megabytes por imagen entre la memoria de tiles y la RAM.
-Ahí es donde queda margen.
-
----
-
 ## Créditos y licencia
 
 Este port parte de **[bo2-360-nx](https://github.com/AlvaroEPena/bo2-360-nx), de Álvaro E. Peña**, que es quien hizo
