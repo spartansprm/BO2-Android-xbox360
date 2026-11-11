@@ -1,0 +1,8 @@
+
+#pragma once
+
+namespace bo2zm::ui {
+
+constexpr const char kMenusLua[] = R"bo2zmlua(@BO2ZM_UI_LUA_TEXT@)bo2zmlua";
+
+}

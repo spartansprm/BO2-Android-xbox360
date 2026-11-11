@@ -1,0 +1,836 @@
+#include "bo2zm_extras.h"
+#include "bo2zm_script_manager.h"
+#include "bo2zm_launch_options.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <iterator>
+#include <string>
+#include <thread>
+
+#include <rex/cvar.h>
+#include <rex/logging.h>
+#include <rex/platform.h>
+#include <rex/runtime.h>
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#endif
+
+#include "bo2zm_autoexec.h"
+#include "bo2zm_cheats.h"
+#include "bo2zm_debug_options.h"
+#include "bo2zm_mode.h"
+#include "bo2zm_preset.h"
+#include "bo2zm_relaunch.h"
+#include "bo2zm_settings.h"
+#include "bo2zm_switch.h"
+
+#if REX_PLATFORM_SWITCH
+extern "C" void RexSwitchPerfSwapIntervalForce(int vblanks);
+extern "C" uint32_t RexSwitchPerfTakeDequeueWaitUs(void);
+#endif
+
+REXCVAR_DECLARE(bool, bo2zm_show_fps);
+REXCVAR_DEFINE_BOOL(bo2zm_vsync_drain, true, "Graphics",
+                    "VSYNC: when the presenter had to wait for a free buffer (two finished frames already queued for "
+                    "the screen), the next frame starts one refresh later, so finished frames stop waiting in the "
+                    "queue (input delay). false = as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(bo2zm_vsync_late_start_ms, 8, "Graphics",
+                     "VSYNC: a frame that is ready early starts up to this many ms after its refresh instead of on it, "
+                     "so the game reads the controls later and the frame is still shown on the same refresh (less input "
+                     "delay). The delay grows by 1 ms every 60 frames in time and halves at each frame that comes after "
+                     "its refresh. 0 = on the refresh")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DECLARE(bool, bo2zm_preset_on_screen);
+REXCVAR_DEFINE_STRING(bo2zm_test_start, "", "BO2",
+                      "Test helper: the first game lobby that opens starts this match by itself, \"<map> <start "
+                      "location> <game type> <mode group>\" (Town: \"zm_transit town zstandard zsurvival\"), and the "
+                      "home menu opens the local lobby by itself. Multiplayer: map and game type, e.g. "
+                      "mp_hijacked dm. Empty = "
+                      "off")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(bo2zm_test_god, false, "BO2",
+                    "God mode at start-up (keep player 0 invulnerable). The Extras menu turns it on or off")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(bo2zm_test_ignore, false, "BO2",
+                    "Test helper: zombies ignore player 0 from start-up. The Extras menu turns it on or off")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(bo2zm_test_ammo, false, "BO2",
+                    "Test helper: infinite ammo at start-up. The Extras menu turns it on or off")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(bo2zm_loading_video, true, "BO2",
+                    "The loading screen of Die Rise, Mob of the Dead, Buried and Origins plays the map's video (the "
+                    "game's own). false = the map's loading image, as in an online match. Extras > LOADING SCREEN "
+                    "VIDEO sets it too and saves the pick (loading_video); a value set here wins over the saved pick");
+
+namespace {
+
+using bo2zm::cheats::kFlyOff;
+using bo2zm::cheats::kNoclip;
+using bo2zm::cheats::kUfo;
+
+bool LocalCamoAssetsReady() {
+#if defined(BO2_GAME_CAMPAIGN)
+  return false;
+#else
+  const auto* runtime = rex::Runtime::instance();
+  if (!runtime || bo2zm::mode::IsZombies()) {
+    return false;
+  }
+
+
+  const auto present = [](const std::filesystem::path& root, const char* name) {
+    if (root.empty()) return false;
+    std::error_code error;
+    const auto path = root / name;
+    return std::filesystem::is_regular_file(path, error) && !error &&
+           std::filesystem::file_size(path, error) > 0 && !error;
+  };
+  const auto& game = runtime->game_data_root();
+  const auto& update = runtime->update_data_root();
+  return present(game, "common_mp.ff") && present(game, "base.ipak") &&
+         present(update, "common_patch_mp.ff") && present(update, "patch_mp.ff") &&
+         present(update, "patch_ui_mp.ff") && present(update, "patch_all.ipak");
+#endif
+}
+
+int FpsCounter() {
+  return REXCVAR_GET(bo2zm_show_fps);
+}
+void SetFpsCounter(int on) {
+  rex::cvar::SetFlagByName("bo2zm_show_fps", on ? "true" : "false");
+}
+int LoadingVideo() {
+  return REXCVAR_GET(bo2zm_loading_video);
+}
+void SetLoadingVideo(int on) {
+  rex::cvar::SetFlagByName("bo2zm_loading_video", on ? "true" : "false");
+}
+
+
+int CpuCores() {
+
+  return bo2zm::CpuCoresSetting() == 4 && !bo2zm::CoresSwitchedOff() ? 1 : 0;
+}
+void SetCpuCores(int four) {
+  bo2zm::SetCpuCoresSetting(four ? 4 : 3);
+}
+int CoresInUse() {
+  if (bo2zm::CoresInUse() == 4) {
+    return 1;
+  }
+  if (bo2zm::CoresSwitchedOff()) {
+    return 3;
+  }
+  return bo2zm::CpuCoresSetting() == 4 && bo2zm::ProcessCores() != 4 ? 2 : 0;
+}
+void SetCoresInUse(int) {}
+
+int God() {
+  return bo2zm::cheats::GodMode();
+}
+void SetGod(int on) {
+  bo2zm::cheats::SetGodMode(on);
+}
+
+int Noclip() {
+  return bo2zm::cheats::FlyMode() == kNoclip;
+}
+void SetNoclip(int on) {
+  if (on || bo2zm::cheats::FlyMode() == kNoclip) {
+    bo2zm::cheats::SetFlyMode(on ? kNoclip : kFlyOff);
+  }
+}
+int Ufo() {
+  return bo2zm::cheats::FlyMode() == kUfo;
+}
+void SetUfo(int on) {
+  if (on || bo2zm::cheats::FlyMode() == kUfo) {
+    bo2zm::cheats::SetFlyMode(on ? kUfo : kFlyOff);
+  }
+}
+int Combo() {
+  return bo2zm::cheats::Combo();
+}
+void SetCombo(int on) {
+  bo2zm::cheats::SetCombo(on);
+}
+int ComboMode() {
+  return bo2zm::cheats::ComboMode() == kUfo;
+}
+void SetComboMode(int ufo) {
+  bo2zm::cheats::SetComboMode(ufo ? kUfo : kNoclip);
+}
+int Collision() {
+  return bo2zm::cheats::FlyCollision();
+}
+void SetCollision(int on) {
+  bo2zm::cheats::SetFlyCollision(on);
+}
+int Jump() {
+  return bo2zm::cheats::JumpLevel();
+}
+void SetJump(int level) {
+  bo2zm::cheats::SetJumpLevel(level);
+}
+int HudHidden() {
+  return bo2zm::cheats::HudHidden();
+}
+void SetHudHidden(int hidden) {
+  bo2zm::cheats::SetHudHidden(hidden);
+}
+int ThirdPerson() {
+  return bo2zm::cheats::ThirdPerson();
+}
+void SetThirdPerson(int on) {
+  bo2zm::cheats::SetThirdPerson(on);
+}
+int ThirdCrosshair() {
+  return bo2zm::cheats::ThirdPersonCrosshairSetting();
+}
+void SetThirdCrosshair(int mode) {
+  bo2zm::cheats::SetThirdPersonCrosshair(mode);
+}
+int CrosshairType() {
+  return bo2zm::cheats::CrosshairType();
+}
+void SetCrosshairType(int type) {
+  bo2zm::cheats::SetCrosshairType(type);
+}
+int CrosshairColor() {
+  return bo2zm::cheats::CrosshairColor();
+}
+void SetCrosshairColor(int color) {
+  bo2zm::cheats::SetCrosshairColor(color);
+}
+int Explosive() {
+  return bo2zm::cheats::ExplosiveBullets();
+}
+void SetExplosive(int on) {
+  bo2zm::cheats::SetExplosiveBullets(on);
+}
+int ZombiesIgnore() {
+  return bo2zm::cheats::ZombiesIgnore();
+}
+void SetZombiesIgnore(int on) {
+  bo2zm::cheats::SetZombiesIgnore(on);
+}
+
+
+constexpr const char* kRounds[] = {"r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "r16", "r17", "r18", "r19", "r20", "r21", "r22", "r23", "r24", "r25", "r26", "r27", "r28", "r29", "r30", "r35", "r40", "r45", "r50", "r55", "r60", "r65", "r70", "r75", "r80", "r85", "r90", "r95", "r100", "r110", "r120", "r130", "r140", "r150", "r160", "r170", "r180", "r190", "r200", "r210", "r220", "r230", "r240", "r250", "r255"};
+int g_round_choice = 0;
+std::atomic<bool> g_changed{false};
+constexpr int kCompareEveryFrames = 8;
+int RoundChoice() {
+  return g_round_choice;
+}
+void SetRoundChoice(int index) {
+  g_round_choice = index;
+}
+int KeepPerks() {
+  return bo2zm::cheats::KeepPerksOn();
+}
+void SetKeepPerks(int on) {
+  bo2zm::cheats::SetKeepPerks(on);
+}
+
+constexpr const char* kFpsCaps[] = {"30", "60"};
+constexpr int kFpsCapValues[] = {30, 60};
+std::atomic<int> g_fps_cap{1};
+std::atomic<int> g_vsync{0};
+int FpsCap() {
+  return g_fps_cap.load(std::memory_order_relaxed);
+}
+
+void ApplyVsync() {
+#if REX_PLATFORM_SWITCH
+  const bool on = g_vsync.load(std::memory_order_relaxed) != 0;
+  RexSwitchPerfSwapIntervalForce(on ? (kFpsCapValues[g_fps_cap.load(std::memory_order_relaxed)] <= 30 ? 2 : 1) : 0);
+#endif
+}
+void SetFpsCap(int index) {
+  g_fps_cap.store(std::clamp(index, 0, int(std::size(kFpsCapValues)) - 1), std::memory_order_relaxed);
+  ApplyVsync();
+}
+int Vsync() {
+  return g_vsync.load(std::memory_order_relaxed);
+}
+void SetVsync(int on) {
+  g_vsync.store(on ? 1 : 0, std::memory_order_relaxed);
+  ApplyVsync();
+}
+
+
+void WaitUntil(std::chrono::steady_clock::time_point when) {
+#if REX_PLATFORM_WIN32
+  static const HANDLE timer = [] {
+    HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!handle) {
+      REXLOG_WARN("[extras] FPS cap: no high resolution timer (Windows 10 1803 or later); the cap paces less evenly");
+    }
+    return handle;
+  }();
+  if (timer) {
+    const auto left = when - std::chrono::steady_clock::now();
+    if (left <= std::chrono::steady_clock::duration::zero()) {
+      return;
+    }
+    LARGE_INTEGER due;
+    due.QuadPart = -std::max<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(left).count() / 100, 1);
+    if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0) &&
+        WaitForSingleObject(timer, INFINITE) == WAIT_OBJECT_0) {
+      return;
+    }
+  }
+#endif
+  std::this_thread::sleep_until(when);
+}
+
+int ShowPreset() {
+  return REXCVAR_GET(bo2zm_preset_on_screen);
+}
+void SetShowPreset(int on) {
+  rex::cvar::SetFlagByName("bo2zm_preset_on_screen", on ? "true" : "false");
+}
+int StopSpawns() {
+  return bo2zm::cheats::StopSpawns();
+}
+void SetStopSpawns(int on) {
+  bo2zm::cheats::SetStopSpawns(on);
+}
+int NoRecoil() {
+  return bo2zm::cheats::NoRecoil();
+}
+void SetNoRecoil(int on) {
+  bo2zm::cheats::SetNoRecoil(on);
+}
+int Ammo() {
+  return bo2zm::cheats::InfiniteAmmo();
+}
+void SetAmmo(int on) {
+  bo2zm::cheats::SetInfiniteAmmo(on);
+}
+int Fov() {
+  return bo2zm::cheats::FieldOfView();
+}
+void SetFov(int level) {
+  bo2zm::cheats::SetFieldOfView(level);
+}
+int Feather() {
+  return bo2zm::cheats::FeatherFall();
+}
+void SetFeather(int on) {
+  bo2zm::cheats::SetFeatherFall(on);
+}
+int GivePap() {
+  return bo2zm::cheats::GivePackAPunch();
+}
+void SetGivePap(int on) {
+  bo2zm::cheats::SetGivePackAPunch(on);
+}
+int CrossPerks() {
+  return bo2zm::cheats::CrossMapPerks();
+}
+int MoveSpeed() {
+  return bo2zm::cheats::MoveSpeed();
+}
+void SetMoveSpeed(int level) {
+  bo2zm::cheats::SetMoveSpeed(level);
+}
+void SetCrossPerks(int on) {
+  bo2zm::cheats::SetCrossMapPerks(on);
+}
+
+constexpr const char* kOffOn[] = {"off", "on"};
+constexpr const char* kDefaultModes[] = {"campaign", "multiplayer", "zombies"};
+
+
+int DefaultMode() {
+  const auto saved = static_cast<bo2zm::launch::Mode>(bo2zm::launch::GetDefaultModeIndex());
+  return static_cast<int>(bo2zm::launch::FirstInstalled(saved, bo2zm::ModesInstalled()));
+}
+void SetDefaultMode(int mode) {
+  if (!bo2zm::ModesInstalled().Has(static_cast<bo2zm::launch::Mode>(mode))) {
+    REXLOG_WARN("[extras] default_mode: {} is not installed", kDefaultModes[mode]);
+    return;
+  }
+  (void)bo2zm::launch::SetDefaultModeIndex(mode);
+}
+constexpr const char* kCoreCounts[] = {"3", "4"};
+constexpr const char* kCoresInUse[] = {"3", "4", "3 (not a 4-core launch)", "3 (switched off by the failsafe)"};
+constexpr const char* kFastFull[] = {"fast", "full"};
+constexpr const char* kCachesOnOff[] = {"on", "off"};
+constexpr const char* kLogDetails[] = {"normal", "detailed"};
+constexpr const char* kMaxLogFiles[] = {"5", "10", "20", "off"};
+constexpr const char* kPurgeTiers[] = {"logs", "screenshots", "traces", "all"};
+constexpr const char* kFlyModes[] = {"noclip", "ufo"};
+constexpr const char* kJumpLevels[] = {"normal", "high", "higher", "highest", "insane", "extreme"};
+constexpr const char* kMoveSpeeds[] = {"normal", "fast", "faster", "fastest"};
+constexpr const char* kShownHidden[] = {"shown", "hidden"};
+constexpr const char* kCrosshairModes[] = {"off", "aiming", "always"};
+constexpr const char* kCrosshairTypes[] = {"dot", "cross"};
+constexpr const char* kCrosshairColorNames[] = {"white", "red", "green", "cyan", "yellow", "magenta", "orange"};
+constexpr const char* kFovs[] = {"55", "60", "65", "70", "75", "80", "85", "90", "95", "100", "105", "110"};
+constexpr const char* kDebugPresets[] = {"custom", "basic", "verbose", "graphics", "performance", "crash", "full"};
+
+
+bool IsCheat(std::string_view name) {
+  constexpr std::string_view kCheats[] = {"god",      "noclip",     "ufo",        "fov",   "ammo", "explosive",
+                                          "norecoil", "zm_ignore",  "zm_nospawn", "keep_perks", "round", "jump",
+                                          "feather",  "hud",        "third",      "speed"};
+  return std::find(std::begin(kCheats), std::end(kCheats), name) != std::end(kCheats);
+}
+
+bool IsPlayerOption(std::string_view name) {
+  constexpr std::string_view names[] = {
+      "cheats", "god", "noclip", "ufo", "collision", "combo", "combo_mode", "fov", "ammo", "explosive",
+      "norecoil", "zm_ignore", "keep_perks", "jump", "feather", "hud", "third", "third_crosshair",
+      "tpp_type", "tpp_color", "give_pap", "cross_perks", "speed"};
+  return std::find(std::begin(names), std::end(names), name) != std::end(names);
+}
+
+bool IsWorldCommand(std::string_view name) {
+  constexpr std::string_view names[] = {"bo2zm_hold", "bo2zm_release", "bo2zm_round", "bo2zm_goto_round",
+      "bo2zm_powerup", "bo2zm_kill_zombies", "bo2zm_doors", "bo2zm_power", "bo2zm_debris", "bo2zm_zm_nospawn"};
+  return std::find(std::begin(names), std::end(names), name) != std::end(names);
+}
+
+bool IsPlayerAction(std::string_view name) {
+  constexpr std::string_view names[] = {"bo2zm_perk", "bo2zm_remove_perks", "bo2zm_give_weapon",
+      "bo2zm_pap_weapon", "bo2zm_max_points", "bo2zm_reset_cheats"};
+  return std::find(std::begin(names), std::end(names), name) != std::end(names);
+}
+
+bool ValidLocal(int local) { return local >= 0 && local < 4; }
+bool PrimaryLocal(int local) { return ValidLocal(local) && local == bo2zm::cheats::PrimaryLocalPlayer(); }
+int PlayerMaster(int local) {
+  int value = 0;
+  return ValidLocal(local) && bo2zm::cheats::GetPlayerOption(local, "cheats", value) ? value : 0;
+}
+
+void SetCheats(int on);
+
+struct Option {
+  const char* name;
+  const char* saved_as;
+  const char* const* values;
+  int count;
+  int (*get)();
+  void (*set)(int);
+};
+
+constexpr Option kOptions[] = {
+    {"default_mode", nullptr, kDefaultModes, 3, DefaultMode, SetDefaultMode},
+    {"fps", "fps_counter", kOffOn, 2, FpsCounter, SetFpsCounter},
+    {"loading_video", "loading_video", kOffOn, 2, LoadingVideo, SetLoadingVideo},
+    {"cpu_cores", "cpu_cores", kCoreCounts, 2, CpuCores, SetCpuCores},
+    {"cpu_cores_in_use", nullptr, kCoresInUse, 4, CoresInUse, SetCoresInUse},
+    {"cheats", "cheats", kOffOn, 2, bo2zm::cheats::MenuCheats, SetCheats},
+    {"dbg", "debug", kOffOn, 2, bo2zm::debug::Enabled, bo2zm::debug::SetEnabled},
+    {"dbg_preset", "debug_preset", kDebugPresets, 7, bo2zm::debug::Preset, bo2zm::debug::SetPreset},
+    {"mark_location", "mark_location", kOffOn, 2, bo2zm::debug::MarkLocation, bo2zm::debug::SetMarkLocation},
+    {"god", nullptr, kOffOn, 2, God, SetGod},
+    {"noclip", nullptr, kOffOn, 2, Noclip, SetNoclip},
+    {"ufo", nullptr, kOffOn, 2, Ufo, SetUfo},
+    {"collision", "fly_collision", kOffOn, 2, Collision, SetCollision},
+    {"combo", "fly_combo", kOffOn, 2, Combo, SetCombo},
+    {"combo_mode", "fly_combo_mode", kFlyModes, 2, ComboMode, SetComboMode},
+    {"fov", "field_of_view", kFovs, 12, Fov, SetFov},
+    {"ammo", nullptr, kOffOn, 2, Ammo, SetAmmo},
+    {"explosive", nullptr, kOffOn, 2, Explosive, SetExplosive},
+    {"norecoil", nullptr, kOffOn, 2, NoRecoil, SetNoRecoil},
+    {"zm_ignore", nullptr, kOffOn, 2, ZombiesIgnore, SetZombiesIgnore},
+    {"zm_nospawn", nullptr, kOffOn, 2, StopSpawns, SetStopSpawns},
+    {"keep_perks", nullptr, kOffOn, 2, KeepPerks, SetKeepPerks},
+    {"fps_cap", "fps_cap", kFpsCaps, 2, FpsCap, SetFpsCap},
+    {"vsync", "vsync", kOffOn, 2, Vsync, SetVsync},
+
+    {"dbg_textures", nullptr, kFastFull, 2, bo2zm::debug::TextureChecks,
+     bo2zm::debug::SetTextureChecks},
+    {"dbg_constants", nullptr, kFastFull, 2, bo2zm::debug::Constants, bo2zm::debug::SetConstants},
+    {"dbg_caches", nullptr, kCachesOnOff, 2, bo2zm::debug::Caches, bo2zm::debug::SetCaches},
+    {"dbg_safe", nullptr, kOffOn, 2, bo2zm::debug::SafeRenderer, bo2zm::debug::SetSafeRenderer},
+    {"dbg_log", nullptr, kLogDetails, 2, bo2zm::debug::LogDetail, bo2zm::debug::SetLogDetail},
+    {"dbg_profile", nullptr, kOffOn, 2, bo2zm::debug::StackProfile, bo2zm::debug::SetStackProfile},
+    {"max_logs", "max_log_files", kMaxLogFiles, 4, bo2zm::debug::MaxLogFiles, bo2zm::debug::SetMaxLogFiles},
+    {"purge_tier", nullptr, kPurgeTiers, 4, bo2zm::debug::PurgeTier, bo2zm::debug::SetPurgeTier},
+    {"show_preset", "show_preset", kOffOn, 2, ShowPreset, SetShowPreset},
+    {"round", nullptr, kRounds, int(std::size(kRounds)), RoundChoice, SetRoundChoice},
+    {"jump", nullptr, kJumpLevels, 6, Jump, SetJump},
+    {"speed", nullptr, kMoveSpeeds, 4, MoveSpeed, SetMoveSpeed},
+    {"feather", nullptr, kOffOn, 2, Feather, SetFeather},
+    {"hud", nullptr, kShownHidden, 2, HudHidden, SetHudHidden},
+    {"third", nullptr, kOffOn, 2, ThirdPerson, SetThirdPerson},
+    {"third_crosshair", "third_person_crosshair", kCrosshairModes, 3, ThirdCrosshair, SetThirdCrosshair},
+    {"tpp_type", "tpp_crosshair_type", kCrosshairTypes, 2, CrosshairType, SetCrosshairType},
+    {"tpp_color", "tpp_crosshair_color", kCrosshairColorNames, 7, CrosshairColor, SetCrosshairColor},
+    {"give_pap", "give_pack_a_punch", kOffOn, 2, GivePap, SetGivePap},
+    {"cross_perks", "cross_map_perks", kOffOn, 2, CrossPerks, SetCrossPerks},
+};
+constexpr size_t kCount = sizeof(kOptions) / sizeof(kOptions[0]);
+
+
+std::array<int, kCount> g_parked = [] {
+  std::array<int, kCount> parked;
+  parked.fill(-1);
+  return parked;
+}();
+
+void SetCheats(int on) {
+  const int local = bo2zm::cheats::PrimaryLocalPlayer();
+  if (!ValidLocal(local) || (on != 0) == (PlayerMaster(local) != 0)) return;
+  if (!on) for (size_t i = 0; i < kCount; ++i) {
+    if (IsCheat(kOptions[i].name) && !IsPlayerOption(kOptions[i].name) &&
+        std::string_view(kOptions[i].name) != "round") g_parked[i] = kOptions[i].get();
+  }
+  bo2zm::cheats::SetPlayerOption(local, "cheats", on);
+  if (on) for (size_t i = 0; i < kCount; ++i) {
+    if (g_parked[i] < 0) continue;
+    kOptions[i].set(g_parked[i]);
+    g_parked[i] = -1;
+  }
+}
+
+int PlayerValue(int local, size_t index) {
+  const auto& option = kOptions[index];
+  if (IsPlayerOption(option.name)) {
+    int value = -1;
+    if (!ValidLocal(local) || !bo2zm::cheats::GetPlayerOption(local, option.name, value) ||
+        value < 0 || value >= option.count) return -1;
+    return value;
+  }
+  return g_parked[index] >= 0 ? g_parked[index] : option.get();
+}
+
+bool SetPlayerValue(int local, const Option& option, int value) {
+  if (IsPlayerOption(option.name)) {
+    if (!ValidLocal(local)) return false;
+    if (std::string_view(option.name) == "cheats" && PrimaryLocal(local)) SetCheats(value);
+    else return bo2zm::cheats::SetPlayerOption(local, option.name, value);
+    return true;
+  }
+  if (ValidLocal(local) && !PrimaryLocal(local)) return false;
+  option.set(value);
+  return true;
+}
+
+
+int Parse(const Option& option, std::string_view text) {
+  for (int i = 0; i < option.count; ++i) {
+    if (text == option.values[i]) {
+      return i;
+    }
+  }
+  if (option.values == kOffOn && (text == "true" || text == "false")) {
+    return text == "true";
+  }
+  if (option.values == kFpsCaps && (text == "15" || text == "45")) {
+    return text == "15" ? 0 : 1;
+  }
+  if (text.empty() || text.size() > 3 || text.find_first_not_of("0123456789") != std::string_view::npos) {
+    return -1;
+  }
+  const int index = std::atoi(std::string(text).c_str());
+  return index < option.count ? index : -1;
+}
+
+std::string PlayerPreference(int controller, const Option& option) {
+  return "player." + std::to_string(controller) + "." + option.saved_as;
+}
+
+void LoadPlayerPreferences(int controller, int local) {
+  for (const auto& option : kOptions) {
+    if (!IsPlayerOption(option.name) || !option.saved_as) continue;
+    auto saved = bo2zm::settings::Get(PlayerPreference(controller, option));
+    if (!saved && PrimaryLocal(local)) saved = bo2zm::settings::Get(option.saved_as);
+    if (!saved) continue;
+    const int value = Parse(option, *saved);
+    if (value >= 0) SetPlayerValue(local, option, value);
+  }
+}
+
+void AppendUi(PPCContext& ctx, uint8_t* base, std::string& pending, std::string command) {
+  if (!pending.empty() && pending.size() + command.size() + 2 > 1500) {
+    bo2zm::autoexec::ExecuteCommands(ctx, base, pending);
+    pending.clear();
+  }
+  if (!pending.empty()) pending += "; ";
+  pending += command;
+}
+
+}
+
+
+std::atomic<uint32_t> g_vsync_waits{0};
+uint32_t g_vsync_missed = 0;
+int g_vsync_late_ms = 0;
+static void PaceOnRefresh(int cap) {
+  using Clock = std::chrono::steady_clock;
+  constexpr auto kRefresh = std::chrono::microseconds(16667);
+  constexpr uint32_t kQueuedWaitUs = 2000;
+  static Clock::time_point start{};
+  auto due = start + (60 / cap) * kRefresh;
+#if REX_PLATFORM_SWITCH
+  static const bool drain = REXCVAR_GET(bo2zm_vsync_drain);
+  if (RexSwitchPerfTakeDequeueWaitUs() > kQueuedWaitUs) {
+    g_vsync_waits.store(g_vsync_waits.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    if (drain) {
+      due += kRefresh;
+    }
+  }
+  static Clock::time_point report{};
+  if (Clock::now() - report >= std::chrono::seconds(10)) {
+    if (report != Clock::time_point{}) {
+      REXLOG_INFO("[extras] VSYNC at {}: in the last 10 s {} frames found that the presenter had waited for a free "
+                  "buffer (two finished frames queued){}",
+                  cap, g_vsync_waits.exchange(0, std::memory_order_relaxed),
+                  drain ? "; each started a refresh later (bo2zm_vsync_drain)" : "");
+      REXLOG_INFO("[extras] VSYNC at {}: in the last 10 s {} frames came after their refresh (late start now {} ms, "
+                  "at most {})",
+                  cap, g_vsync_missed, g_vsync_late_ms, REXCVAR_GET(bo2zm_vsync_late_start_ms));
+      g_vsync_missed = 0;
+    }
+    report = Clock::now();
+  }
+#endif
+  if (Clock::now() < due - std::chrono::milliseconds(1)) {
+
+
+    while (bo2zm::WaitForNextRefresh(50) && Clock::now() < due - kRefresh / 2) {
+    }
+    static const int late_max = std::clamp(REXCVAR_GET(bo2zm_vsync_late_start_ms), 0, 25);
+    static int in_time = 0;
+    if (++in_time >= 60 && g_vsync_late_ms < late_max) {
+      ++g_vsync_late_ms;
+      in_time = 0;
+    }
+    if (g_vsync_late_ms > 0) {
+      const auto refresh = Clock::now();
+      start = refresh;
+      WaitUntil(refresh + std::chrono::milliseconds(g_vsync_late_ms));
+      return;
+    }
+  } else {
+    ++g_vsync_missed;
+    g_vsync_late_ms /= 2;
+  }
+  start = Clock::now();
+}
+
+void bo2zm::extras::PaceFrame() {
+  using Clock = std::chrono::steady_clock;
+  static Clock::time_point next{};
+  int cap = kFpsCapValues[g_fps_cap.load(std::memory_order_relaxed)];
+  bool vsync = g_vsync.load(std::memory_order_relaxed) != 0;
+
+  const int front_end_cap = bo2zm::preset::FrontEnd() ? bo2zm::preset::FrontEndFpsCap() : 0;
+  if (front_end_cap > 0) {
+    cap = front_end_cap;
+    vsync = false;
+  } else if ((cap >= 60 && !vsync) || !bo2zm::cheats::InMatch()) [[likely]] {
+    next = {};
+    return;
+  }
+  if (vsync) {
+    next = {};
+    if (bo2zm::HasRefreshSignal()) {
+      PaceOnRefresh(cap);
+    }
+    return;
+  }
+  const auto period = std::chrono::nanoseconds(1000000000 / cap);
+  const auto now = Clock::now();
+  if (next == Clock::time_point{} || now - next > period) {
+    next = now;
+  }
+  next += period;
+  if (next > now) {
+    WaitUntil(next);
+  }
+}
+
+bool bo2zm::extras::RunCommand(std::string_view name, std::string_view argument) {
+  return RunPlayerCommand(bo2zm::cheats::PrimaryLocalPlayer(), name, argument);
+}
+
+bool bo2zm::extras::RunPlayerCommand(int local, std::string_view name, std::string_view argument) {
+  constexpr std::string_view kPrefix = "bo2zm_";
+  if (name.substr(0, kPrefix.size()) != kPrefix) {
+    return false;
+  }
+  const auto full_name = name;
+  name.remove_prefix(kPrefix.size());
+  g_changed.store(true, std::memory_order_relaxed);
+  if (!bo2zm::mode::IsZombies() && (IsPlayerOption(name) || IsWorldCommand(full_name) || IsPlayerAction(full_name)))
+    return true;
+  if (IsWorldCommand(full_name) && !PrimaryLocal(local)) {
+    REXLOG_WARN("[extras] {} requires the primary local player", full_name);
+    return true;
+  }
+  if (name == "reset_cheats") {
+    if (!ValidLocal(local)) return true;
+    if (PrimaryLocal(local)) g_parked.fill(-1);
+    return bo2zm::cheats::RunPlayerCommand(local, full_name, argument);
+  }
+  if ((name == "goto_round" || IsCheat(name)) && !PlayerMaster(local)) {
+    REXLOG_INFO("[extras] bo2zm_{} ignored: CHEATS is off", name);
+    return true;
+  }
+  if (name == "goto_round") {
+    bo2zm::cheats::GoToRound(std::atoi(kRounds[g_round_choice] + 1));
+    return true;
+  }
+  if ((!ValidLocal(local) || PrimaryLocal(local)) && bo2zm::debug::RunCommand(std::string(full_name), argument)) {
+    return true;
+  }
+  for (size_t i = 0; i < kCount; ++i) {
+    const Option& option = kOptions[i];
+    if (name != option.name) {
+      continue;
+    }
+    if (!IsPlayerOption(name) && ValidLocal(local) && !PrimaryLocal(local)) return true;
+    const int value = Parse(option, argument);
+    if (value < 0) {
+      REXLOG_WARN("[extras] bo2zm_{}: unknown value {}", option.name, argument);
+    } else if (value != PlayerValue(local, i)) {
+      REXLOG_INFO("[extras] {} {}", option.name, option.values[value]);
+      SetPlayerValue(local, option, value);
+    }
+    return true;
+  }
+  return ValidLocal(local) && bo2zm::cheats::RunPlayerCommand(local, full_name, argument);
+}
+
+void bo2zm::extras::EveryFrame(PPCContext& ctx, uint8_t* base) {
+  bo2zm::scripts::EveryFrame(ctx, base);
+  static int shown[kCount];
+  static bool started = false;
+  static int frames = 0;
+  static std::array<bool, 4> loaded{};
+  static std::array<int, 4> mapped = {-2, -2, -2, -2};
+  static auto player_shown = [] {
+    std::array<std::array<int, kCount>, 4> result;
+    for (auto& values : result) values.fill(-2);
+    return result;
+  }();
+
+
+  if (started && !g_changed.load(std::memory_order_relaxed) && ++frames < kCompareEveryFrames) [[likely]] {
+    return;
+  }
+  frames = 0;
+  g_changed.store(false, std::memory_order_relaxed);
+  if (!started) [[unlikely]] {
+    started = true;
+    bo2zm::cheats::SetGodMode(REXCVAR_GET(bo2zm_test_god));
+    if (REXCVAR_GET(bo2zm_test_ignore)) {
+      bo2zm::cheats::SetZombiesIgnore(true);
+    }
+    if (REXCVAR_GET(bo2zm_test_ammo)) {
+      bo2zm::cheats::SetInfiniteAmmo(true);
+    }
+
+
+    bo2zm::autoexec::ExecuteCommands(ctx, base, "set bo2zm_build_ui \"" + bo2zm::debug::BuildText() +
+                                                    "\"; set bo2zm_log_ui \"" + bo2zm::debug::LogFileName() +
+                                                    "\"; set bo2zm_modes_ui \"" +
+                                                    bo2zm::ModesInstalled().Text() +
+                                                    "\"; set bo2zm_campaign_ui " +
+                                                    (bo2zm::CampaignAvailable() ? "1" : "0") +
+                                                    "; set bo2mp_local_camos_ui " +
+                                                    (LocalCamoAssetsReady() ? "1" : "0"));
+    REXLOG_INFO("[extras] Local MP camo assets {}", LocalCamoAssetsReady() ? "ready" : "unavailable");
+    ApplyVsync();
+    if (const std::string& start = REXCVAR_GET(bo2zm_test_start);
+        !start.empty() && start.find_first_of("\";") == std::string::npos) {
+      bo2zm::autoexec::ExecuteCommands(ctx, base, "set bo2zm_test_start_ui \"" + start + "\"");
+      REXLOG_INFO("[extras] test start: {} (from the first game lobby)", start);
+    }
+    bo2zm::debug::LoadCustom();
+    for (size_t i = 0; i < kCount; ++i) {
+      const Option& option = kOptions[i];
+      shown[i] = -1;
+      if (!option.saved_as || IsPlayerOption(option.name)) {
+        continue;
+      }
+
+      if ((std::string_view(option.name) == "loading_video" &&
+           rex::cvar::GetFlagSource("bo2zm_loading_video") != rex::cvar::Source::kDefault) ||
+          (std::string_view(option.name) == "cpu_cores" &&
+           rex::cvar::GetFlagSource("bo2zm_cpu_cores") != rex::cvar::Source::kDefault) ||
+          (std::string_view(option.name) == "max_logs" &&
+           rex::cvar::GetFlagSource("bo2zm_max_log_files") != rex::cvar::Source::kDefault)) {
+        continue;
+      }
+      if (const auto saved = bo2zm::settings::Get(option.saved_as)) {
+        const int value = Parse(option, *saved);
+        if (value >= 0 && value != option.get()) {
+          option.set(value);
+          REXLOG_INFO("[extras] {} {}, from {}", option.name, option.values[value],
+                      bo2zm::settings::File().string());
+        }
+      }
+    }
+    bo2zm::debug::Sync();
+  }
+
+  for (int controller = 0; controller < 4; ++controller) {
+    const int local = bo2zm::cheats::LocalPlayerForController(controller);
+    if (mapped[controller] != local) {
+      mapped[controller] = local;
+      player_shown[controller].fill(-2);
+    }
+    if (bo2zm::mode::IsZombies() && ValidLocal(local) && !loaded[controller]) {
+      LoadPlayerPreferences(controller, local);
+      loaded[controller] = true;
+    }
+  }
+  std::string commands;
+  const int primary = bo2zm::cheats::PrimaryLocalPlayer();
+  for (size_t i = 0; i < kCount; ++i) {
+    const Option& option = kOptions[i];
+    const int value = PlayerValue(primary, i);
+    if (value == shown[i]) [[likely]] {
+      continue;
+    }
+    if (shown[i] >= 0 && option.saved_as && !IsPlayerOption(option.name) && value >= 0 && value < option.count) {
+      bo2zm::settings::Set(option.saved_as, option.values[value]);
+    }
+    shown[i] = value;
+    AppendUi(ctx, base, commands, "set bo2zm_" + std::string(option.name) + "_ui " + std::to_string(value));
+  }
+  for (int controller = 0; controller < 4; ++controller) {
+    const int local = mapped[controller];
+    for (size_t i = 0; i < kCount; ++i) {
+      const auto& option = kOptions[i];
+      if (!IsPlayerOption(option.name) && !IsCheat(option.name)) continue;
+      const int value = bo2zm::mode::IsZombies() && ValidLocal(local) ? PlayerValue(local, i) : -1;
+      const int before = player_shown[controller][i];
+      if (before == value) continue;
+      if (before >= 0 && value >= 0 && value < option.count && option.saved_as && IsPlayerOption(option.name)) {
+        bo2zm::settings::Set(PlayerPreference(controller, option), option.values[value]);
+        if (PrimaryLocal(local)) bo2zm::settings::Set(option.saved_as, option.values[value]);
+      }
+      player_shown[controller][i] = value;
+      AppendUi(ctx, base, commands, "set bo2zm_p" + std::to_string(controller) + "_" + option.name + "_ui " +
+                                    std::to_string(value));
+    }
+  }
+
+  static std::string shown_purge;
+  if (const std::string purge = bo2zm::debug::PurgeLabel(); purge != shown_purge) {
+    shown_purge = purge;
+    AppendUi(ctx, base, commands, "set bo2zm_purge_ui \"" + purge + "\"");
+  }
+  if (!commands.empty()) {
+    bo2zm::autoexec::ExecuteCommands(ctx, base, commands);
+  }
+}

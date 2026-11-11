@@ -1,0 +1,3166 @@
+local LUI = rawget(_G, "LUI")
+if not (LUI and LUI.createMenu and rawget(_G, "require") and rawget(_G, "Engine") and rawget(_G, "UIExpression")) then
+  return false
+end
+if rawget(LUI, "bo2zm") then
+  return true
+end
+local state = {wrappers = {}}
+rawset(LUI, "bo2zm", state)
+
+
+state.campaign = function()
+  local CoD = rawget(_G, "CoD")
+  return CoD ~= nil and CoD.isSinglePlayer == true
+end
+state.zombies = function()
+  local CoD = rawget(_G, "CoD")
+  return CoD ~= nil and CoD.isZombie == true and not state.campaign()
+end
+
+
+state.modeInstalled = function(mode)
+  local list = UIExpression.DvarString(nil, "bo2zm_modes_ui")
+  if list == nil or list == "" then
+    return mode ~= "cp" or UIExpression.DvarInt(nil, "bo2zm_campaign_ui") == 1
+  end
+  return string.find(" " .. list .. " ", " " .. mode .. " ", 1, true) ~= nil
+end
+
+state.otherModeInstalled = function()
+  local current = state.campaign() and "cp" or (state.zombies() and "zm" or "mp")
+  for _, mode in ipairs({"cp", "mp", "zm"}) do
+    if mode ~= current and state.modeInstalled(mode) then return true end
+  end
+  return false
+end
+
+
+state.modeItem = function(item)
+  local choices, values = {}, {}
+  for i, mode in ipairs({"cp", "mp", "zm"}) do
+    if state.modeInstalled(mode) then
+      table.insert(choices, item.choices[i])
+      table.insert(values, i - 1)
+    end
+  end
+  if #choices < 2 then return {where = item.where} end
+  return {label = item.label, hint = item.hint, setting = item.setting, where = item.where, choices = choices,
+          values = values}
+end
+
+
+local function Log(text)
+  local clean = string.gsub(tostring(text), "[;\"\n]", " ")
+  Engine.ExecNow(0, "bo2zm_log " .. clean)
+end
+
+
+local errors = 0
+local function Safely(f, ...)
+  local ok, result = pcall(f, ...)
+  if ok then
+    return result
+  end
+  if errors < 10 then
+    errors = errors + 1
+    Log("error: " .. tostring(result))
+  end
+end
+
+
+local OnOff = {"OFF", "ON"}
+local Off1On = {0, 1}
+
+
+local RoundChoices = {}
+for round = 1, 30 do
+  table.insert(RoundChoices, tostring(round))
+end
+for round = 35, 100, 5 do
+  table.insert(RoundChoices, tostring(round))
+end
+for round = 110, 250, 10 do
+  table.insert(RoundChoices, tostring(round))
+end
+table.insert(RoundChoices, "255")
+
+local ExtrasPages = {
+  main = {
+    title = "EXTRAS",
+    {label = "SCRIPT LOADER", hint = "Choose or unload a script mod.",
+     page = "scripts"},
+    {label = "DEFAULT GAMEMODE", hint = "Choose the mode opened at launch.",
+     setting = "default_mode", choices = {"CAMPAIGN", "MULTIPLAYER", "ZOMBIES"}, where = "home", modes = true},
+    {zm = true, label = "LOADING SCREEN VIDEO", hint = "Show a video instead of the loading image.", setting = "loading_video",
+     choices = {"DISABLED", "ENABLED"}},
+    {label = "EDIT USERNAME", hint = "Change your player name.", action = "edit_name",
+     where = "home", nameHint = true},
+    {label = "EXPERIMENTAL", hint = "Features still being tested.", page = "experimental"},
+    {zm = true, section = "CHEATS"},
+    {zm = true, label = "CHEATS", hint = "ON: the cheats work. OFF: normal play; your cheat picks are kept and come back when "
+       .. "you turn CHEATS on.", setting = "cheats", choices = OnOff},
+    {zm = true, label = "GOD MODE", hint = "You take no damage.", setting = "god", choices = OnOff, cheat = true},
+    {zm = true, label = "INFINITE AMMO", hint = "Your clip stays full.", setting = "ammo", choices = OnOff, cheat = true},
+    {zm = true, label = "EXPLOSIVE BULLETS", hint = "Your bullets explode where they hit. The blasts never hurt you.",
+     setting = "explosive", choices = OnOff, cheat = true},
+    {zm = true, label = "NO RECOIL", hint = "Shooting does not kick your aim.", setting = "norecoil", choices = OnOff,
+     cheat = true},
+    {zm = true, label = "GIVE MAX POINTS", hint = "Sets your points to 1,000,000.", action = "max_points", where = "game",
+     cheat = true},
+    {zm = true, label = "GAME SPEED", hint = "Slow motion or fast forward, for everything in the match.",
+     dvar = "timescale", choices = {"VERY SLOW", "SLOW", "NORMAL", "FAST", "VERY FAST"},
+     values = {0.25, 0.5, 1, 1.5, 2}, normal = 3, cheat = true},
+    {zm = true, label = "MOVEMENT", hint = "Speed, jumping, gravity, noclip and UFO.", page = "movement"},
+    {zm = true, label = "CAMERA", hint = "Third person, field of view, the gun and the HUD.", page = "camera"},
+    {zm = true, label = "ZOMBIES", hint = "Make zombies ignore you, freeze them, stop spawns or kill them all.", page = "zombies"},
+    {zm = true, label = "POWER UPS", hint = "Spawn power-ups in front of you. Only the ones this map has appear.",
+     page = "powerups", where = "game"},
+    {zm = true, label = "PERKS", hint = "Get any perk, and keep your perks when you go down.", page = "perks"},
+    {zm = true, label = "WEAPONS", hint = "Get any gun this map has in place of the one in your hands, Pack-a-Punched or not.",
+     page = "weapons", where = "game"},
+    {zm = true, label = "DOORS + POWER", hint = "Open or close every door, turn the power on or off.", page = "doors_power",
+     where = "game"},
+    {zm = true, label = "RESET CHEATS", hint = "Every cheat back to normal play, kept picks too. The combo's settings stay.",
+     action = "reset_cheats"},
+    {section = "BUGS"},
+    {label = "DEBUG", hint = "Help find a bug: debug presets, mark the log, take screenshots.", page = "debug"},
+  },
+  scripts = {},
+  script_targets = {},
+  script_issues = {},
+  experimental = {
+    title = "EXPERIMENTAL",
+    {label = "CPU CORES", hint = "4: the game also uses the Switch's 4th CPU core (faster in busy matches). Works only "
+       .. "when the game is started from a forwarder made in sphaira with CPU Cores: 4. Applies at once. IN USE "
+       .. "shows the cores in use; SWITCHED OFF: the 4th core was overloaded, so the game went back to 3 (pick 4 to "
+       .. "try again).", setting = "cpu_cores", choices = {"3", "4"}},
+
+    {label = "IN USE", setting = "cpu_cores_in_use",
+     choices = {"3 CORES", "4 CORES", "3 CORES (NO 4-CORE LAUNCH)", "3 CORES (SWITCHED OFF)"}, status = true},
+  },
+  movement = {
+    title = "MOVEMENT",
+    {label = "MOVE SPEED", hint = "How fast you walk and run (each player picks their own).",
+     setting = "speed", choices = {"NORMAL", "FAST", "FASTER", "FASTEST"}},
+    {label = "UNLIMITED SPRINT", hint = "Sprint without running out of breath. For everyone in the match.",
+     dvar = "player_sprintUnlimited", choices = OnOff, values = Off1On},
+    {label = "JUMP HEIGHT", hint = "How high you jump. Use god mode for the high ones: landings hurt.",
+     setting = "jump", choices = {"NORMAL", "HIGH", "HIGHER", "HIGHEST", "INSANE", "EXTREME"}},
+    {label = "FEATHER FALL", hint = "Fall slowly and steer while falling, to glide from a high jump.",
+     setting = "feather", choices = OnOff},
+    {label = "GRAVITY", hint = "Lower gravity makes jumps and falls float. For everyone in the match.",
+     dvar = "bg_gravity", choices = {"MOON", "LOW", "NORMAL", "HIGH"}, values = {150, 400, 800, 1200}, normal = 3},
+    {section = "FLY"},
+    {label = "NOCLIP", hint = "Fly with the stick, triggers for up and down. One fly mode at a time.",
+     setting = "noclip", choices = OnOff},
+    {label = "UFO", hint = "Fly where the camera looks and float to a stop. One fly mode at a time.",
+     setting = "ufo", choices = OnOff},
+    {label = "COLLISION", hint = "Whether walls stop noclip and UFO.",
+     setting = "collision", choices = {"DISABLED", "ENABLED"}, pref = true},
+    {label = "COMBO", hint = "Aim + D-pad Down turns the combo's fly mode on and off (while CHEATS is on).",
+     setting = "combo", choices = {"DISABLED", "ENABLED"}, pref = true},
+    {label = "COMBO SETS", hint = "The fly mode the combo turns on.", setting = "combo_mode", choices = {"NOCLIP", "UFO"},
+     pref = true},
+  },
+  camera = {
+    title = "CAMERA",
+    {label = "THIRD PERSON", hint = "The camera follows you from behind (the game's own third person).",
+     setting = "third", choices = OnOff},
+    {label = "TPP CROSSHAIR", hint = "A crosshair in third person. Aiming moves the camera over your shoulder.",
+     setting = "third_crosshair", choices = {"DISABLED", "WHEN AIMING", "ALWAYS"}, pref = true},
+    {label = "TPP CROSSHAIR TYPE", hint = "The third person crosshair's shape.", setting = "tpp_type",
+     choices = {"DOT", "SMALL CROSS"}, pref = true},
+    {label = "TPP CROSSHAIR COLOR", hint = "The third person crosshair's color.", setting = "tpp_color",
+     choices = {"WHITE", "RED", "GREEN", "CYAN", "YELLOW", "MAGENTA", "ORANGE"}, pref = true},
+    {label = "FIELD OF VIEW", hint = "How wide the camera sees, in degrees. The game's is 65. RESET CHEATS puts it back.",
+     setting = "fov", choices = {"55", "60", "65", "70", "75", "80", "85", "90", "95", "100", "105", "110"}},
+    {label = "GUN", hint = "Show or hide your gun and hands.",
+     dvar = "cg_drawGun", choices = {"SHOWN", "HIDDEN"}, values = {1, 0}},
+    {label = "HUD", hint = "Show or hide the HUD (points, ammo, round).", setting = "hud", choices = {"SHOWN", "HIDDEN"}},
+  },
+  zombies = {
+    title = "ZOMBIES",
+    {label = "ZOMBIES IGNORE YOU", hint = "Zombies leave you alone (each player picks their own).", setting = "zm_ignore",
+     choices = {"DISABLED", "ENABLED"}},
+    {label = "ZOMBIES FREEZE", hint = "Every zombie stops where it is. For everyone in the match.",
+     dvar = "g_ai", choices = {"DISABLED", "ENABLED"}, values = {1, 0}},
+    {label = "STOP SPAWNS", hint = "No new zombies appear. The round waits until spawns are back. For everyone in the match.",
+     setting = "zm_nospawn", choices = {"DISABLED", "ENABLED"}},
+    {label = "KILL ALL ZOMBIES", hint = "Kills every zombie now. The kills are yours.", action = "kill_zombies",
+     where = "game"},
+    {label = "ROUND", hint = "Pick a round and press A: this round ends and the next one is the round you picked.",
+     setting = "round", choices = RoundChoices, apply = "bo2zm_goto_round", where = "game"},
+  },
+  perks = {
+    title = "PERKS",
+    {label = "KEEP PERKS", hint = "Keep your perks when you go down and get revived (or respawn).",
+     setting = "keep_perks", choices = {"DISABLED", "ENABLED"}},
+    {label = "REMOVE PERKS", hint = "Press A to lose every perk you have.", action = "remove_perks", where = "game"},
+    {label = "CROSS-MAP PERKS", hint = "ENABLED also lists the perks of other maps' machines, marked OTHER MAP: each one "
+       .. "says how much of it works here. Open this page again to see the list change.", setting = "cross_perks",
+     choices = {"DISABLED", "ENABLED"}, pref = true},
+
+
+    {label = "JUGGERNOG", hint = "Press A to get it.", action = "perk", arg = "specialty_armorvest", where = "game",
+     other = "Works here (more health), without its HUD icon."},
+    {label = "QUICK REVIVE", hint = "Press A to get it.", action = "perk", arg = "specialty_quickrevive", where = "game",
+     other = "Works here (faster revives; solo: one self-revive), without its HUD icon."},
+    {label = "SPEED COLA", hint = "Press A to get it.", action = "perk", arg = "specialty_fastreload", where = "game",
+     other = "Works here (faster reloads), without its HUD icon."},
+    {label = "DOUBLE TAP", hint = "Press A to get it.", action = "perk", arg = "specialty_rof", where = "game",
+     other = "Works here (faster fire), without its HUD icon."},
+    {label = "STAMIN-UP", hint = "Press A to get it.", action = "perk", arg = "specialty_longersprint", where = "game",
+     other = "Works here (longer sprint), without its HUD icon."},
+    {label = "PHD FLOPPER", hint = "Press A to get it.", action = "perk", arg = "specialty_flakjacket", where = "game",
+     other = "In part: explosions and falls stop hurting you, but the dive-to-prone blast is only in its own map's files."},
+    {label = "DEADSHOT DAIQUIRI", hint = "Press A to get it.", action = "perk", arg = "specialty_deadshot", where = "game",
+     other = "Works here (steadier aim), without its HUD icon."},
+    {label = "MULE KICK", hint = "Press A to get it.", action = "perk", arg = "specialty_additionalprimaryweapon",
+     where = "game", other = "Works here (a third gun), without its HUD icon."},
+    {label = "TOMBSTONE", hint = "Press A to get it.", action = "perk", arg = "specialty_scavenger", where = "game",
+     other = "Does nothing here: its script only runs on a map that has the machine."},
+    {label = "WHO'S WHO", hint = "Press A to get it.", action = "perk", arg = "specialty_finalstand", where = "game",
+     other = "Does nothing here: its script only runs on a map that has the machine."},
+    {label = "ELECTRIC CHERRY", hint = "Press A to get it.", action = "perk", arg = "specialty_grenadepulldeath",
+     where = "game", other = "Does nothing here: its script only runs on a map that has the machine."},
+    {label = "VULTURE AID", hint = "Press A to get it.", action = "perk", arg = "specialty_nomotionsensor", where = "game",
+     other = "Does nothing here: its script is only in Buried's files."},
+  },
+  doors_power = {
+    title = "DOORS + POWER",
+    {label = "OPEN ALL DOORS", hint = "Opens every door and clears every debris pile that is bought, for free "
+       .. "(Mob of the Dead's Afterlife doors too).", action = "doors", arg = "open", where = "game"},
+    {label = "CLOSE ALL DOORS", hint = "Closes every open door the game's way (zombies cannot pass); you can buy them "
+       .. "again. Cleared debris stays cleared (the game removes it), and doors the power opens stay open.",
+     action = "doors", arg = "close", where = "game"},
+    {label = "POWER ON", hint = "Turns the power on: perk machines, Pack-a-Punch and electric doors.", action = "power",
+     arg = "on", where = "game", mapHints = {
+       zm_tomb = "Captures every generator: each zone's perk machines, random perk machine and box come on.",
+       zm_prison = "Mob of the Dead has no power to turn on: its machines always work."}},
+    {label = "POWER OFF", hint = "Turns the power off: perk machines and Pack-a-Punch stop working until POWER ON. "
+       .. "Doors stay as they are.", action = "power", arg = "off", where = "game", mapHints = {
+       zm_tomb = "Every generator is lost to the zombies: each zone's machines and box go off until POWER ON.",
+       zm_prison = "Mob of the Dead has no power to turn off: its machines always work."}},
+    {label = "REMOVE FREE DEBRIS", hint = "Clears what opens without buying it: Buried's barricades that Leroy breaks. "
+       .. "The areas behind them open. Only Buried has them.", action = "debris", arg = "remove", where = "game"},
+    {label = "PUT DEBRIS BACK", hint = "Puts the barricades REMOVE FREE DEBRIS cleared back, solid again (not the ones "
+       .. "Leroy broke: the game deletes those).", action = "debris", arg = "restore", where = "game"},
+  },
+
+  weapons = {
+    title = "WEAPONS",
+    custom = true,
+  },
+
+
+  debug = {
+    title = "DEBUG",
+    {label = "DEBUG", hint = "OFF: the game plays normally, whatever is picked below (you can still set it up). ON: "
+       .. "the debug options below apply.", setting = "dbg", choices = OnOff},
+    {label = "DEBUG PRESET", hint = "BASIC: nothing extra. VERBOSE: detailed log. GRAPHICS: + safe renderer. "
+       .. "PERFORMANCE: stack profile (next start on). CRASH (or freeze): log and profile. FULL: all. CUSTOM: yours.",
+     setting = "dbg_preset", choices = {"CUSTOM", "BASIC", "VERBOSE", "GRAPHICS", "PERFORMANCE", "CRASH", "FULL"}},
+    {section = "REPORTING A BUG"},
+    {label = "MARK THE LOG", hint = "Press A when you see a bug: a marked line in the log and a screenshot show us "
+       .. "the moment.", action = "mark"},
+    {label = "TAKE SCREENSHOT", hint = "Press A to save the screen in sdmc:/switch/bo2zm/captures.",
+     action = "screenshot"},
+    {label = "MARK LOCATION", hint = "ON (with DEBUG on) puts MARK LOCATION at the top of the pause menu in a match: "
+       .. "it saves where you stand and look, the map and round, and four screenshots, so we can go back to that "
+       .. "exact spot.", setting = "mark_location", choices = OnOff},
+    {label = "BUILD AND LOG FILE", hint = "", infoHint = true, action = "info"},
+    {label = "MAX LOG FILES", hint = "How many logs the game keeps, one per start: each start deletes the older ones. "
+       .. "OFF keeps every log. From the next start, whatever DEBUG is.", setting = "max_logs",
+     choices = {"5", "10", "20", "OFF"}},
+    {label = "PURGE DEBUG INFO", hint = "Deletes debug files (logs, screenshots, traces) from the SD card: pick what, "
+       .. "see how much, then confirm. Your settings, saves and the game stay.", page = "purge"},
+    {label = "LOG DETAIL", hint = "DETAILED adds the game's debug lines to the log (a bigger file).",
+     setting = "dbg_log", choices = {"NORMAL", "DETAILED"}},
+    {label = "STACK PROFILE", hint = "From the next start, logs/rex/rex_profile.log records where each thread spends "
+       .. "its time. It costs frame rate: turn it off afterwards.", setting = "dbg_profile", choices = OnOff},
+    {section = "GRAPHICS BUGS"},
+    {label = "TEXTURE CHECKS", hint = "FULL rechecks every texture's bytes instead of skipping unchanged ones. Try it "
+       .. "for flickering or out of date textures.", setting = "dbg_textures", choices = {"FAST", "FULL"}},
+    {label = "SHADER CONSTANTS", hint = "FULL copies every shader constant, not only the ones a shader reads. Try it "
+       .. "for wrong colors or lighting.", setting = "dbg_constants", choices = {"FAST", "FULL"}},
+    {label = "GEOMETRY CACHES", hint = "OFF uploads models' vertices and indices again every time. Try it for broken "
+       .. "or stretched models.", setting = "dbg_caches", choices = {"ON", "OFF"}},
+    {label = "SAFE RENDERER", hint = "ON turns the three shortcuts above off at once (slower). If a graphics bug goes "
+       .. "away, tell us.", setting = "dbg_safe", choices = OnOff},
+    {label = "RESET DEBUG", hint = "Every debug option back to normal (preset BASIC). CUSTOM keeps your own picks.",
+     action = "debug_reset"},
+  },
+
+
+  purge = {
+    title = "PURGE DEBUG INFO",
+    parent = "debug",
+    opened = "bo2zm_purge_scan",
+    {label = "WHAT TO DELETE", hint = "LOGS: old logs (not this run's), crash and profiler logs, marks. SCREENSHOTS: "
+       .. "captures. TRACES AND TEST FILES: D3D traces, PGO training files, launch captures. ALL: the three. "
+       .. "Settings, saves, caches and the game always stay.", setting = "purge_tier",
+     choices = {"LOGS", "SCREENSHOTS", "TRACES AND TEST FILES", "ALL"}},
+    {label = "COUNTING...", labelDvar = "bo2zm_purge_ui", hint = "A deletes the files counted on this line (it cannot "
+       .. "be undone). B goes back without deleting.", action = "purge"},
+  },
+
+
+  powerups = {
+    title = "POWER UPS",
+    {label = "NUKE", hint = "Press A to spawn.", action = "powerup", arg = "nuke"},
+    {label = "MAX AMMO", hint = "Press A to spawn.", action = "powerup", arg = "full_ammo"},
+    {label = "INSTA-KILL", hint = "Press A to spawn.", action = "powerup", arg = "insta_kill"},
+    {label = "DOUBLE POINTS", hint = "Press A to spawn.", action = "powerup", arg = "double_points"},
+    {label = "CARPENTER", hint = "Press A to spawn.", action = "powerup", arg = "carpenter"},
+    {label = "FIRE SALE", hint = "Press A to spawn.", action = "powerup", arg = "fire_sale"},
+    {label = "DEATH MACHINE", hint = "Press A to spawn.", action = "powerup", arg = "minigun"},
+    {label = "FREE PERK", hint = "Press A to spawn.", action = "powerup", arg = "free_perk"},
+    {label = "ZOMBIE BLOOD", hint = "Press A to spawn.", action = "powerup", arg = "zombie_blood"},
+    {label = "BONUS POINTS", hint = "Press A to spawn.", action = "powerup", arg = "bonus_points_player"},
+    {label = "RANDOM WEAPON", hint = "Press A to spawn.", action = "powerup", arg = "random_weapon"},
+  },
+}
+
+local ExtrasHint = "Your username, the loading screen video, cheats and debug options."
+
+
+local PageNames = {"main", "scripts", "script_targets", "script_issues", "experimental", "movement", "camera", "zombies",
+                   "powerups", "perks", "debug", "weapons", "doors_power", "purge"}
+
+
+local CheatPages = {movement = true, camera = true, zombies = true, powerups = true, perks = true,
+                    doors_power = true}
+
+
+local function ListHas(dvar, name)
+  local list = UIExpression.DvarString(nil, dvar)
+  if list == nil or list == "" then
+    return true
+  end
+  return string.find(" " .. list .. " ", " " .. name .. " ", 1, true) ~= nil
+end
+
+
+local function OnThisMap(item, controller)
+  if state.worldItem(item) and not state.primaryController(controller) then return false end
+  if item.action == "perk" then
+    if ListHas("bo2zm_map_perks_ui", item.arg) then
+      return item.label, item.hint
+    end
+    if UIExpression.DvarInt(nil, state.playerDvar("cross_perks", controller)) == 1 then
+      return item.label .. " (OTHER MAP)", "Press A to get it. " .. item.other
+    end
+    return false
+  end
+  if item.action == "powerup" and not ListHas("bo2zm_map_powerups_ui", item.arg) then
+    return false
+  end
+
+  local mapHint = item.mapHints and item.mapHints[UIExpression.DvarString(nil, "ui_mapname")]
+  if mapHint then
+    return item.label, mapHint
+  end
+  return item.label or item.section, item.hint
+end
+for _, page in ipairs(PageNames) do
+  if CheatPages[page] then
+    for _, item in ipairs(ExtrasPages[page]) do
+      if not item.section then item.player = true end
+      if not (item.section or item.page or item.pref) then
+        item.cheat = true
+      end
+    end
+  end
+end
+
+
+(function()
+  for _, item in ipairs(ExtrasPages.main) do
+    if item.cheat or item.setting == "cheats" or item.action == "reset_cheats" then item.player = true end
+    if item.page == "doors_power" then item.world = true end
+  end
+  function state.validController(controller)
+    return type(controller) == "number" and controller >= 0 and controller <= 3 and controller % 1 == 0
+  end
+  function state.playerItem(item) return item.player == true or item.cheat == true or item.world == true end
+  function state.worldItem(item)
+    return item.world == true or item.dvar ~= nil or item.setting == "round" or item.setting == "zm_nospawn"
+      or item.action == "kill_zombies" or item.action == "doors" or item.action == "power" or item.action == "debris"
+  end
+  function state.playerDvar(option, controller)
+    if not state.validController(controller) then return "bo2zm_player_unassigned_ui" end
+    return "bo2zm_p" .. controller .. "_" .. option .. "_ui"
+  end
+  function state.pageController(menu, expected, event)
+    local controller = expected
+    if type(menu.getOwner) == "function" then
+      local ok, owner = pcall(menu.getOwner, menu)
+      if not ok then return end
+      controller = owner
+    end
+    if not state.validController(controller) or (expected ~= nil and controller ~= expected)
+        or (event and event.controller ~= nil and event.controller ~= controller) then return end
+    return controller
+  end
+  function state.execPlayer(controller, command, world)
+    if not state.zombies() or not state.validController(controller)
+        or (world and not state.primaryController(controller)) then return false end
+    Engine.ExecNow(controller, "bo2zm_player " .. controller .. " " .. command)
+    return true
+  end
+end)()
+
+
+local function ResetCheats(controller)
+  for _, page in ipairs(PageNames) do
+    for _, item in ipairs(ExtrasPages[page]) do
+      if item.dvar and state.primaryController(controller) then
+        state.execPlayer(controller, "bo2zm_release " .. item.dvar .. " " .. tostring(item.values[item.normal or 1]), true)
+      end
+    end
+  end
+  state.execPlayer(controller, "bo2zm_reset_cheats")
+  if state.applyHud then
+    Safely(state.applyHud, controller, false)
+  end
+end
+
+local Actions = {
+  scripts_load = function(controller) Engine.ExecNow(controller, "bo2zm_scripts_load") end,
+  scripts_unload = function(controller) Engine.ExecNow(controller, "bo2zm_scripts_unload") end,
+  scripts_refresh = function(controller) Engine.ExecNow(controller, "bo2zm_scripts_refresh") end,
+  reset_cheats = ResetCheats,
+  max_points = function(controller)
+    state.execPlayer(controller, "bo2zm_max_points")
+  end,
+  kill_zombies = function(controller)
+    state.execPlayer(controller, "bo2zm_kill_zombies", true)
+  end,
+  powerup = function(controller, item)
+    state.execPlayer(controller, "bo2zm_powerup " .. item.arg)
+  end,
+  perk = function(controller, item)
+    state.execPlayer(controller, "bo2zm_perk " .. item.arg)
+  end,
+  remove_perks = function(controller)
+    state.execPlayer(controller, "bo2zm_remove_perks")
+  end,
+  give_weapon = function(controller, item)
+    state.execPlayer(controller, "bo2zm_give_weapon " .. item.arg)
+  end,
+  pap_weapon = function(controller)
+    state.execPlayer(controller, "bo2zm_pap_weapon")
+  end,
+  doors = function(controller, item)
+    state.execPlayer(controller, "bo2zm_doors " .. item.arg, true)
+  end,
+  debris = function(controller, item)
+    state.execPlayer(controller, "bo2zm_debris " .. item.arg, true)
+  end,
+  power = function(controller, item)
+    state.execPlayer(controller, "bo2zm_power " .. item.arg, true)
+  end,
+  edit_name = function(controller)
+    Engine.ExecNow(controller, "bo2zm_edit_name")
+  end,
+  mark = function(controller)
+    Engine.ExecNow(controller, "bo2zm_mark")
+  end,
+  screenshot = function(controller)
+    Engine.ExecNow(controller, "bo2zm_screenshot")
+  end,
+  debug_reset = function(controller)
+    Engine.ExecNow(controller, "bo2zm_debug_reset")
+  end,
+  purge = function(controller)
+    Engine.ExecNow(controller, "bo2zm_purge")
+  end,
+}
+
+
+local function InfoText()
+  return "Build " .. UIExpression.DvarString(nil, "bo2zm_build_ui") .. ". This run's log: "
+    .. "sdmc:/switch/bo2zm/logs/" .. UIExpression.DvarString(nil, "bo2zm_log_ui") .. "."
+end
+
+
+local PresetItem = {
+  label = "GRAPHICS PRESET",
+  hint = "Lower presets trade detail for frame rate. Changing any setting below makes it CUSTOM; picking a preset "
+    .. "sets them all.",
+  setting = "preset", choices = {"LOWEST", "VERY LOW", "LOW", "MEDIUM", "HIGH", "CUSTOM"},
+}
+
+
+local GraphicsItems = {
+  {label = "TEXTURE DETAIL", hint = "How sharp textures are. Lower uses smaller copies of them.",
+   setting = "gfx_texture", choices = {"LOWEST", "LOW", "MEDIUM", "HIGH"}},
+  {label = "MODEL DETAIL", hint = "How soon models switch to simpler versions with distance.",
+   setting = "gfx_model", choices = {"LOW", "MEDIUM", "HIGH", "ULTRA"}},
+  {label = "DRAW DISTANCE", hint = "How far the world is drawn. Town's fog hides most of what lies past MEDIUM; "
+     .. "Buried's caves have no fog: with FAR OBJECTS on SIMPLE the sky stays hidden at any distance (or FAR or "
+     .. "FULL; a map profile can keep it there).",
+   setting = "gfx_distance", choices = {"SHORTEST", "SHORT", "MEDIUM", "FAR", "FULL"}},
+  {label = "FAR OBJECTS", hint = "What lies past the draw distance. HIDE: not drawn, so the sky can show through "
+     .. "cave walls and far buildings. SIMPLE: big shapes stay, in their simplest form, for a little frame rate.",
+   setting = "gfx_far", choices = {"HIDE", "SIMPLE"}},
+  {label = "SHADOWS", hint = "Sun and spotlight shadows.",
+   setting = "gfx_shadows", choices = {"OFF", "LOW", "MEDIUM", "HIGH"}},
+  {label = "DYNAMIC LIGHTS", hint = "Lights from muzzle flashes, explosions and effects.",
+   setting = "gfx_lights", choices = {"OFF", "LOW", "MEDIUM", "HIGH"}},
+  {label = "SCREEN EFFECTS", hint = "Depth of field, flames, water on the screen and clouds.",
+   setting = "gfx_effects", choices = OnOff},
+  {label = "DECALS", hint = "Blood, scorch and bullet marks, and how far they show.",
+   setting = "gfx_decals", choices = {"OFF", "NEAR", "MEDIUM", "FAR"}},
+  {label = "CORPSES AND DEBRIS", hint = "How many bodies and pieces of debris stay around.",
+   setting = "gfx_bodies", choices = {"FEWEST", "FEW", "SOME", "ALL"}},
+}
+
+
+local ProfileNames = {"GLOBAL", "TOWN", "FARM", "BUS DEPOT", "TRANZIT", "DINER", "NUKETOWN", "DIE RISE",
+                      "MOB OF THE DEAD", "BURIED", "ORIGINS"}
+local MapProfileItem = {
+  label = "MAP PROFILE",
+  hint = "The profile the settings below show and change. GLOBAL: every map without a profile of its own.",
+  setting = "profile", choices = ProfileNames,
+}
+
+local ProfileInUseItem = {
+  label = "PROFILE IN USE",
+  setting = "profile", choices = ProfileNames, status = true,
+}
+
+
+local EnableProfileItem = {
+  label = "ENABLE PROFILE",
+  hint = "ON: the map above loads its own settings, the ones below while it is picked (the first time, a copy of "
+    .. "GLOBAL). OFF: it uses GLOBAL.",
+  setting = "profile_on", choices = {"OFF", "ON", "N/A"}, statusChoice = 3,
+}
+local EnableProfileGameItem = {
+  label = "ENABLE PROFILE",
+  hint = "PROFILE IN USE: the settings this map uses. ON: this map gets its own settings from now on, saved for it "
+    .. "(the first time, a copy of GLOBAL). OFF: it goes back to GLOBAL.",
+  setting = "profile_on", choices = {"OFF", "ON", "N/A"}, statusChoice = 3,
+}
+
+
+local FpsCapItem = {
+  label = "FPS CAP",
+  hint = "The highest frame rate in a match (menus keep the game's own). 60 is the game's own.",
+  setting = "fps_cap", choices = {"30", "60"},
+}
+
+
+local VsyncItem = {
+  label = "VSYNC",
+  hint = "Each frame waits for the screen to refresh. With FPS CAP 30 the screen paces a steady 30: the smoothest "
+    .. "choice when the game cannot hold 60.",
+  setting = "vsync", choices = OnOff,
+}
+
+
+local ShowPresetItem = {
+  label = "SHOW PRESET",
+  hint = "Shows the graphics preset in the top-right corner, and on the Switch the CPU cores in use (3 or 4). "
+    .. "Disabled, the preset only shows briefly when the button combination changes it.",
+  setting = "show_preset", choices = {"DISABLED", "ENABLED"},
+}
+
+
+local FpsCounterItem = {
+  label = "FPS COUNTER",
+  hint = "Shows the frames per second in the top-left corner.",
+  setting = "fps", choices = OnOff,
+}
+
+
+local function Protect(f)
+  return function(...)
+    return Safely(f, ...)
+  end
+end
+
+
+local function OnEvent(menu, eventName, handler, keep)
+  local original = menu.m_eventHandlers and menu.m_eventHandlers[eventName]
+  menu:registerEventHandler(eventName, function(self, event)
+    local result
+    if keep and original then
+      result = original(self, event)
+    end
+    Safely(handler, self, event)
+    return result
+  end)
+end
+
+
+local function MessagePopup(menu, controller, text)
+  local popup = menu:openPopup("Error", controller)
+  if popup then
+    popup.anyControllerAllowed = true
+    popup:setMessage(text)
+  end
+end
+
+
+local function BlockedText(item, controller)
+  if (item.zm or state.playerItem(item)) and not state.zombies() then return "Cheats are available in Zombies." end
+  if state.worldItem(item) and not state.primaryController(controller) then
+    return "Only the local lobby leader can change this."
+  end
+  if item.cheat and UIExpression.DvarInt(nil, state.playerDvar("cheats", controller)) ~= 1 then
+    return "Turn CHEATS on first (the first option under CHEATS in Extras)."
+  end
+end
+
+
+local function Refocus(button, controller)
+  if button and button:isInFocus() then
+    button:processEvent({name = "lose_focus", controller = controller})
+    button:processEvent({name = "gain_focus", controller = controller})
+  end
+end
+
+
+local function CloseField(menu, name)
+  if menu[name] then
+    menu[name]:close()
+    menu[name] = nil
+  end
+end
+
+
+local function InGame()
+  return UIExpression.IsInGame() == 1
+end
+
+
+local function Track(menu, selector)
+  local tracked = menu.bo2zmTracked
+  if not tracked then
+    tracked = {}
+    menu.bo2zmTracked = tracked
+    menu:addElement(LUI.UITimer.new(250, "bo2zm_refresh_selectors", false))
+    menu:registerEventHandler("bo2zm_refresh_selectors", Protect(function(self, event)
+      for _, s in ipairs(tracked) do
+        if s.bo2zmPicked then
+          s.bo2zmPicked = nil
+        else
+          s:refreshChoice()
+          if s.bo2zmRefreshed then
+            s.bo2zmRefreshed()
+          end
+        end
+      end
+    end))
+  end
+  table.insert(tracked, selector)
+end
+
+
+local ApplyStatus
+do
+
+
+  local function SetArrows(selector, shown)
+    for _, arrow in ipairs({selector.leftArrow or false, selector.rightArrow or false}) do
+      if arrow then
+        if shown then
+          local text, over = CoD.ButtonTextColor, CoD.BOIIOrange
+          arrow:registerAnimationState("default", {red = text.r, green = text.g, blue = text.b, alpha = 1})
+          arrow:registerAnimationState("button_over", {red = over.r, green = over.g, blue = over.b, alpha = 1})
+          arrow:animateToState(selector:isInFocus() and "button_over" or "default")
+        else
+          arrow:registerAnimationState("disabled", {alpha = 0})
+          arrow:animateToState("disabled")
+        end
+      end
+    end
+  end
+
+
+  local function StatusRow(selector, on)
+    if (selector.bo2zmStatus == true) ~= on then
+      selector.bo2zmStatus = on
+      if on then
+        selector:disableCycling()
+        selector:disable()
+      else
+        selector:enableCycling()
+        selector:enable()
+      end
+      SetArrows(selector, not on)
+    end
+    if (selector:isFocusable() == true) == on and not (on and selector:isInFocus()) then
+      if on then
+        selector:makeNotFocusable()
+      else
+        selector:makeFocusable()
+      end
+      local list = selector:getParent()
+      if list then
+        LUI.UIVerticalList.UpdateNavigation(list)
+      end
+    end
+  end
+
+
+  local function SkipChoice(selector, skip)
+    selector.cycle = function(self, forward, userRequested)
+      local count = self.m_choices and #self.m_choices or 0
+      local index = self.m_currentChoice or 0
+      for _ = 1, count do
+        if forward then
+          index = index % count + 1
+        else
+          index = (index - 2) % count + 1
+        end
+        if index ~= skip then
+          break
+        end
+      end
+      if count == 0 or index == skip or index == self.m_currentChoice then
+        return
+      end
+      if self.m_sfx then
+        Engine.PlaySound(self.m_sfx)
+      end
+      CoD.LeftRightSelector.SetCurrentChoice(self, index)
+      self:updateChoice(userRequested)
+    end
+  end
+
+
+  function ApplyStatus(selector, item)
+    if item.status ~= nil then
+      StatusRow(selector, item.status)
+    elseif item.statusChoice then
+      SkipChoice(selector, item.statusChoice)
+      selector.bo2zmRefreshed = Protect(function()
+        StatusRow(selector, selector.m_currentChoice == item.statusChoice)
+      end)
+      selector.bo2zmRefreshed()
+    end
+  end
+end
+
+
+local function ItemDvar(item, controller)
+  if state.playerItem(item) and not state.worldItem(item) then return state.playerDvar(item.setting, controller) end
+  if item.setting then
+    return "bo2zm_" .. item.setting .. "_ui"
+  end
+  return "bo2zm_hold_" .. item.dvar
+end
+
+local function PickCommand(item, index, value)
+  if item.setting then
+    return "bo2zm_" .. item.setting .. " " .. tostring(item.values and value or (index - 1))
+  end
+  if index == (item.normal or 1) then
+    return "bo2zm_release " .. item.dvar .. " " .. tostring(value)
+  end
+  return "bo2zm_hold " .. item.dvar .. " " .. tostring(value)
+end
+
+
+local function ChoiceValue(item, index)
+  return item.values and item.values[index] or (index - 1)
+end
+
+
+local function AddHeading(list, text)
+  list:addSpacer(CoD.CoD9Button.Height / 2)
+  local heading = list:addText(text)
+  heading:setTopBottom(true, false, 0, CoD.CoD9Button.TextHeight)
+  heading:setFont(CoD.fonts.Condensed)
+  heading:setRGB(CoD.trueOrange.r, CoD.trueOrange.g, CoD.trueOrange.b)
+  return heading
+end
+
+
+local FitList, TooTall
+do
+  local HintLines = 4
+
+
+  local function HintRoom()
+    return HintLines * (CoD.HintText.Height + 4) + 10
+  end
+
+  function FitList(menu, list, left, right)
+    local bottom = CoD.Menu.Height - CoD.ButtonPrompt.Height - HintRoom()
+    list:setTopBottom(true, false, CoD.Menu.TitleHeight, bottom)
+    list:setUseStencil(true)
+    local hint = list.hintText
+    if hint and hint:getParent() == list then
+      list:removeElement(hint)
+      hint:setLeftRight(true, false, left, right)
+      hint:setTopBottom(true, false, bottom + 10, bottom + 10 + CoD.HintText.Height)
+      menu:addElement(hint)
+    end
+  end
+
+
+  function TooTall(rows, headings)
+    local spacing = CoD.ButtonList.ButtonSpacing or 0
+    local height = rows * (CoD.CoD9Button.Height + spacing)
+      + headings * (CoD.CoD9Button.Height / 2 + CoD.CoD9Button.TextHeight + 2 * spacing)
+    return CoD.Menu.TitleHeight + height + HintRoom() > CoD.Menu.Height - CoD.ButtonPrompt.Height
+  end
+end
+
+
+local function AddChoices(menu, selector, controller, item)
+  for i, label in ipairs(item.choices) do
+    local value = ChoiceValue(item, i)
+    selector:addChoice(controller, label, value, nil, Protect(function(params, userRequested)
+      if userRequested then
+        if item.status or i == item.statusChoice then
+          return false
+        end
+        if state.playerItem(item) and not state.pageController(menu, controller, params) then return false end
+        local blocked = BlockedText(item, controller)
+        if blocked then
+          MessagePopup(menu, controller, blocked)
+          return false
+        end
+        selector.bo2zmPicked = true
+        local command = PickCommand(item, i, value)
+        if state.playerItem(item) then
+          if not state.execPlayer(controller, command, state.worldItem(item)) then return false end
+        else
+          Engine.ExecNow(controller, command)
+        end
+        if item.setting == "hud" and state.applyHud then
+          state.applyHud(controller, i == 2 and UIExpression.DvarInt(nil, state.playerDvar("cheats", controller)) == 1)
+        elseif item.setting == "cheats" and state.applyHud then
+          state.applyHud(controller, i == 2 and UIExpression.DvarInt(nil, state.playerDvar("hud", controller)) == 1)
+        end
+      end
+    end))
+  end
+  Track(menu, selector)
+end
+
+
+local function DefaultToNormal(selector, item)
+  local normal = tostring(ChoiceValue(item, item.normal or 1))
+  local read = selector.getCurrentValue
+  selector.getCurrentValue = function(self)
+    local value = read(self)
+    if value == nil or value == "" then
+      return normal
+    end
+    return value
+  end
+  selector.currentValue = selector:getCurrentValue()
+end
+
+
+local function PageMenuName(page)
+  return page == "main" and "Bo2zmExtras" or ("Bo2zmExtras_" .. page)
+end
+
+local function OpenPage(menu, controller, page)
+  local name = PageMenuName(page)
+  if InGame() or not state.zombies() then
+    menu:saveState()
+    menu:openMenu(name, controller)
+    menu:close()
+  elseif page == "main" then
+    menu:openPopup(name, controller)
+  else
+    local home = menu.occludedMenu
+    menu:close()
+    home:openPopup(name, controller)
+  end
+end
+
+local function CreatePage(controller, page)
+  local items = ExtrasPages[page]
+  local name = PageMenuName(page)
+  local menu
+  if InGame() then
+    menu = CoD.InGameMenu.New(name, controller, items.title, CoD.isSinglePlayer)
+    menu:setPreviousMenu(page == "main" and (state.campaign() and "ObjectiveInfoMenu" or "class")
+                         or PageMenuName(items.parent or "main"))
+  elseif not state.zombies() then
+
+    menu = CoD.Menu.New(name)
+    menu:setOwner(controller)
+    menu:addTitle(items.title)
+    menu:setPreviousMenu(page == "main" and (state.campaign() and "CampaignMenu" or "MainMenu")
+                         or PageMenuName(items.parent or "main"))
+  else
+    menu = CoD.Menu.New(name)
+    menu:setOwner(controller)
+    menu:addTitle(items.title)
+    menu:addLargePopupBackground()
+    if page ~= "main" then
+      menu:registerEventHandler("button_prompt_back", Protect(function(self, event)
+        local home = self.occludedMenu
+        self:close()
+        home:openPopup(PageMenuName(items.parent or "main"), event.controller or controller)
+      end))
+    end
+  end
+
+
+  menu.anyControllerAllowed = not InGame()
+  menu:addSelectButton()
+  menu:addBackButton()
+
+  local list = CoD.ButtonList.new()
+
+  list:setLeftRight(true, false, 0, CoD.Options and CoD.Options.Width or CoD.ButtonList.DefaultWidth)
+  list:setTopBottom(true, false, CoD.Menu.TitleHeight, CoD.Menu.TitleHeight + 720)
+  menu:addElement(list)
+  menu.buttonList = list
+
+  local first
+  local inGame = InGame()
+  local rows, headings = 0, 0
+  for _, item in ipairs(items) do
+    if item.modes then item = state.modeItem(item) end
+    local element
+    local label, hint = OnThisMap(item, controller)
+    if item.where and (item.where == "game") ~= inGame then
+
+    elseif item.zm and not state.zombies() then
+
+    elseif not label then
+
+    elseif item.section then
+      AddHeading(list, item.section)
+      headings = headings + 1
+    elseif item.textDvar then
+      element = list:addDvarLeftRightSelector(controller, item.label, "bo2zm_scripts_text_ui", item.hint)
+      AddChoices(menu, element, controller, {setting = "scripts_text", choices = {""}, status = true})
+      element.refreshChoice = function(self)
+        local text = UIExpression.DvarString(nil, item.textDvar) or ""
+        if text ~= self.bo2zmText then
+          self.bo2zmText = text
+          self:clearChoices()
+          self:addChoice(controller, text, 0, nil, function() end)
+          CoD.LeftRightSelector.SetCurrentChoice(self, 1)
+          self:updateChoice(false)
+        end
+      end
+      element:refreshChoice()
+      ApplyStatus(element, {status = true})
+    elseif item.page or item.action then
+      if item.nameHint then
+        hint = "Now: " .. UIExpression.DvarString(nil, "bo2zm_name_ui") .. ". " .. hint
+      elseif item.infoHint then
+        hint = InfoText()
+      end
+      element = list:addButton(label, hint)
+      element:setActionEventName("bo2zm_page_button")
+      element.bo2zmItem = item
+      if item.labelDvar then
+
+        element.refreshChoice = function(self)
+          local text = UIExpression.DvarString(nil, item.labelDvar)
+          if text ~= nil and text ~= "" and text ~= self.bo2zmText then
+            self.bo2zmText = text
+            self:setLabel(text)
+            Refocus(self, controller)
+          end
+        end
+        element:refreshChoice()
+        Track(menu, element)
+      end
+    else
+      element = list:addDvarLeftRightSelector(controller, item.label, ItemDvar(item, controller), item.hint)
+      if item.dvar then
+        DefaultToNormal(element, item)
+      end
+      AddChoices(menu, element, controller, item)
+      ApplyStatus(element, item)
+      if item.apply then
+
+        element:registerEventHandler("button_action", Protect(function(self, event)
+          if not state.pageController(menu, controller, event) then return end
+          local blocked = BlockedText(item, controller)
+          if blocked then
+            MessagePopup(menu, controller, blocked)
+          else
+            state.execPlayer(controller, item.apply, state.worldItem(item))
+          end
+        end))
+      end
+    end
+    if element then
+      rows = rows + 1
+      if element:isFocusable() then
+        first = first or element
+      end
+    end
+  end
+  if TooTall(rows, headings) then
+    FitList(menu, list, 0, CoD.Options and CoD.Options.Width or CoD.ButtonList.DefaultWidth)
+  end
+  menu:registerEventHandler("bo2zm_page_button", Protect(function(self, event)
+    if not state.pageController(self, controller, event) then return end
+    local item = event.button.bo2zmItem
+    local blocked = BlockedText(item, controller)
+    if blocked then
+      MessagePopup(self, event.controller or controller, blocked)
+    elseif item.page then
+      OpenPage(self, event.controller or controller, item.page)
+    elseif item.action == "info" then
+      MessagePopup(self, event.controller or controller, InfoText())
+    elseif item.action == "message" then
+      MessagePopup(self, event.controller or controller, item.message)
+    else
+      Actions[item.action](event.controller or controller, item)
+      if item.refreshPage then OpenPage(self, event.controller or controller, item.refreshPage) end
+    end
+  end))
+  if items.opened then
+    Engine.ExecNow(controller, items.opened)
+  end
+  if first then
+    first:processEvent({name = "gain_focus", controller = controller})
+  end
+  return menu
+end
+
+
+local CreateWeaponsPage
+do
+  local GunColumns, GunRows = 3, 8
+  local GunsPerPage = GunColumns * GunRows
+  local GunColumnWidth = 300
+  local GunCategoryHints = {pistol = "Pistol", smg = "Submachine gun", rifle = "Assault rifle", shotgun = "Shotgun",
+                            lmg = "Light machine gun", sniper = "Sniper rifle", launcher = "Launcher",
+                            special = "Wonder weapon"}
+  local PapItem = {label = "PACK-A-PUNCH",
+                   hint = "ON: the guns below come Pack-a-Punched (when the gun has an upgrade).",
+                   setting = "give_pap", choices = {"OFF", "ON"}, pref = true, player = true}
+  local PapCurrentItem = {label = "PACK-A-PUNCH CURRENT WEAPON", hint = "Upgrades the gun in your hands.",
+                          action = "pap_weapon", cheat = true}
+
+  local function MapGuns()
+    local guns = {}
+    local count = UIExpression.DvarInt(nil, "bo2zm_guns_ui_count") or 0
+    local part = 0
+    while #guns < count and part < 40 do
+      local text = UIExpression.DvarString(nil, "bo2zm_guns_ui_" .. part) or ""
+      for name, key, category, upgradable in string.gmatch(text, "([%w_]+),([%w_]+),(%a+),(%d)") do
+        table.insert(guns, {name = name, key = key, category = category, upgradable = upgradable == "1"})
+      end
+      part = part + 1
+    end
+    return guns
+  end
+
+
+  local function GunLabel(gun)
+    local ok, text = pcall(Engine.Localize, gun.key)
+    if ok and type(text) == "string" and text ~= "" and text ~= gun.key and not string.find(text, "_", 1, true) then
+      if string.find(gun.name, "_bowie", 1, true) then
+        text = text .. " (BOWIE)"
+      end
+      return string.upper(text)
+    end
+    local plain = string.gsub(gun.name, "_zm$", "")
+    return string.upper(plain)
+  end
+
+  function CreateWeaponsPage(controller)
+    local name = PageMenuName("weapons")
+    local menu = CoD.InGameMenu.New(name, controller, ExtrasPages.weapons.title, CoD.isSinglePlayer)
+    menu:setPreviousMenu(PageMenuName("main"))
+    menu.anyControllerAllowed = not InGame()
+    menu:addSelectButton()
+    menu:addBackButton()
+
+    local guns = MapGuns()
+    local pages = math.max(1, math.ceil(#guns / GunsPerPage))
+    local rowHeight = CoD.CoD9Button.Height + (CoD.ButtonList.ButtonSpacing or 0)
+    local hintTop = CoD.Menu.TitleHeight + 3 * rowHeight + 20 + GunRows * rowHeight + 10
+    local hint = CoD.HintText.new({leftAnchor = true, rightAnchor = false, left = 0,
+                                   right = GunColumns * GunColumnWidth,
+                                   topAnchor = true, bottomAnchor = false, top = hintTop,
+                                   bottom = hintTop + CoD.HintText.Height})
+    menu:addElement(hint)
+
+    local head = CoD.ButtonList.new(nil, nil, nil, hint)
+    head:setLeftRight(true, false, 0, CoD.Options and CoD.Options.Width or CoD.ButtonList.DefaultWidth)
+    head:setTopBottom(true, false, CoD.Menu.TitleHeight, CoD.Menu.TitleHeight + 3 * rowHeight + 10)
+    menu:addElement(head)
+    local pap = head:addDvarLeftRightSelector(controller, PapItem.label, ItemDvar(PapItem, controller), PapItem.hint)
+    AddChoices(menu, pap, controller, PapItem)
+    local papCurrent = head:addButton(PapCurrentItem.label, PapCurrentItem.hint)
+    papCurrent:setActionEventName("bo2zm_page_button")
+    papCurrent.bo2zmItem = PapCurrentItem
+    local pageText = head:addText("")
+    pageText:setTopBottom(true, false, 0, CoD.CoD9Button.TextHeight)
+    pageText:setFont(CoD.fonts.Condensed)
+    pageText:setRGB(CoD.trueOrange.r, CoD.trueOrange.g, CoD.trueOrange.b)
+
+    local page = 1
+    local columns = {}
+    local function ShowPage(focus)
+      for _, column in ipairs(columns) do
+        column:close()
+      end
+      columns = {}
+      if #guns == 0 then
+        pageText:setText("THIS MAP'S GUNS ARE NOT KNOWN YET: OPEN THIS PAGE AGAIN IN A MOMENT.")
+        return
+      end
+      pageText:setText("PAGE " .. page .. " OF " .. pages .. (pages > 1 and "   LB / RB: OTHER PAGES" or ""))
+      local grid = {}
+      local first = (page - 1) * GunsPerPage
+      for c = 1, GunColumns do
+        local column = CoD.ButtonList.new(nil, nil, nil, hint)
+        local left = (c - 1) * GunColumnWidth
+        local gridTop = CoD.Menu.TitleHeight + 3 * rowHeight + 20
+        column:setLeftRight(true, false, left, left + GunColumnWidth - 10)
+        column:setTopBottom(true, false, gridTop, gridTop + GunRows * rowHeight)
+        menu:addElement(column)
+        table.insert(columns, column)
+        grid[c] = {}
+        for r = 1, GunRows do
+          local gun = guns[first + (c - 1) * GunRows + r]
+          if gun then
+            local text = (GunCategoryHints[gun.category] or "Gun") .. ". A: get it in place of the gun in your hands"
+              .. (gun.upgradable and " (with PACK-A-PUNCH ON: upgraded)." or " (no Pack-a-Punch upgrade on this map).")
+            local button = column:addButton(GunLabel(gun), text)
+            button:setActionEventName("bo2zm_page_button")
+            button.bo2zmItem = {action = "give_weapon", arg = gun.name, cheat = true}
+            grid[c][r] = button
+          end
+        end
+      end
+
+
+      for c = 1, GunColumns do
+        for r, button in ipairs(grid[c]) do
+          local function Neighbour(other)
+            local list = grid[other]
+            return list and (list[r] or list[#list])
+          end
+          button.navigation = button.navigation or {}
+          button.navigation.left = Neighbour(c - 1)
+          button.navigation.right = Neighbour(c + 1)
+        end
+        if grid[c][1] then
+          grid[c][1].navigation.up = papCurrent
+        end
+      end
+      papCurrent.navigation = papCurrent.navigation or {}
+      papCurrent.navigation.down = grid[1][1]
+      if focus and grid[1][1] then
+        papCurrent:processEvent({name = "lose_focus", controller = controller})
+        grid[1][1]:processEvent({name = "gain_focus", controller = controller})
+      end
+    end
+    ShowPage(false)
+
+    local function ChangePage(step)
+      if pages > 1 then
+        page = (page - 1 + step + pages) % pages + 1
+        ShowPage(true)
+      end
+    end
+    menu:addRightButtonPrompt(CoD.ButtonPrompt.new("alt2", "PACK-A-PUNCH", menu, "bo2zm_toggle_pap"))
+    if pages > 1 then
+      menu:addRightButtonPrompt(CoD.ButtonPrompt.new("shoulderr", "NEXT PAGE", menu, "bo2zm_gun_page_next"))
+      menu:addRightButtonPrompt(CoD.ButtonPrompt.new("shoulderl", "PREVIOUS PAGE", menu, "bo2zm_gun_page_prev"))
+    end
+    menu:registerEventHandler("bo2zm_gun_page_next", Protect(function(self, event)
+      if not state.pageController(self, controller, event) then return end
+      ChangePage(1)
+    end))
+    menu:registerEventHandler("bo2zm_gun_page_prev", Protect(function(self, event)
+      if not state.pageController(self, controller, event) then return end
+      ChangePage(-1)
+    end))
+    menu:registerEventHandler("bo2zm_toggle_pap", Protect(function(self, event)
+      if not state.pageController(self, controller, event) then return end
+      local blocked = BlockedText(PapItem, controller)
+      if blocked then
+        MessagePopup(self, event.controller or controller, blocked)
+        return
+      end
+      state.execPlayer(controller,
+        "bo2zm_give_pap " .. (UIExpression.DvarInt(nil, ItemDvar(PapItem, controller)) == 1 and "0" or "1"))
+    end))
+    menu:registerEventHandler("bo2zm_page_button", Protect(function(self, event)
+      if not state.pageController(self, controller, event) then return end
+      local item = event.button.bo2zmItem
+      local blocked = BlockedText(item, controller)
+      if blocked then
+        MessagePopup(self, event.controller or controller, blocked)
+      else
+        Actions[item.action](event.controller or controller, item)
+      end
+    end))
+    pap:processEvent({name = "gain_focus", controller = controller})
+    Log("weapons page: " .. #guns .. " guns, " .. pages .. " pages")
+    return menu
+  end
+end
+
+local function PageBuilder(page)
+  return function(controller)
+    if page == "scripts" then
+      Engine.ExecNow(controller, "bo2zm_scripts_refresh")
+      local choices = {"NONE"}
+      local count = math.min(32, math.max(0, UIExpression.DvarInt(nil, "bo2zm_scripts_count_ui") or 0))
+      for i = 0, count - 1 do
+        table.insert(choices, UIExpression.DvarString(nil, "bo2zm_script_" .. i .. "_name_ui"))
+      end
+      ExtrasPages.scripts = {
+        title = "SCRIPT LOADER", parent = "main",
+        {label = "SELECT MOD", setting = "script_pick", choices = choices,
+         hint = state.campaign() and "Campaign scripts are not supported yet. This page manages the next Zombies launch."
+             or "Folders in scripts/ beside the executable. Flat and nested layouts work. Only mods for this gamemode appear."},
+        {label = "ACTIVE MOD", textDvar = "bo2zm_scripts_active_ui"},
+        {label = "STATUS", textDvar = "bo2zm_scripts_status_ui"},
+        {label = "PATH SOURCE", textDvar = "bo2zm_scripts_route_ui"},
+        {label = "BASE PATH", textDvar = "bo2zm_scripts_base_ui"},
+        {label = "SCAN RESULT", textDvar = "bo2zm_scripts_scan_ui"},
+        {label = "CHECK RESULT", textDvar = "bo2zm_scripts_preview_ui"},
+        {label = "CHECK SCRIPTS", page = "script_targets",
+         hint = "Validate exact targets without loading. INTERNAL uses stored names. FILES requires base: / keeps the full hierarchy; a folder prefixes every script."},
+        {label = "SETUP ISSUES", page = "script_issues",
+         hint = "Missing or invalid mod.ini: view each folder and reason. Valid folders for another gamemode are not setup issues."},
+        {label = state.campaign() and "ENABLE FOR ZOMBIES" or "LOAD SELECTED + RESTART", action = "scripts_load",
+         hint = state.campaign() and "Saves the selected mod for the next Zombies launch. Loading in Zombies ends the current match."
+             or "Saves this mode's selected mod. A change restarts the game and ends the current match."},
+        {label = state.campaign() and "DISABLE SCRIPTS" or "UNLOAD ALL + RESTART", action = "scripts_unload",
+         hint = "Keeps the files and disables this mode's scripts. A restart clears the mod's threads, HUD and effects."},
+        {label = "REFRESH LIST", action = "scripts_refresh", refreshPage = "scripts",
+         hint = "Read the mod folders again."},
+      }
+    elseif page == "script_targets" then
+
+      Engine.ExecNow(controller, "bo2zm_scripts_check")
+      local items = {
+        title = "SCRIPT TARGETS", parent = "scripts",
+        {label = "CHECK RESULT", textDvar = "bo2zm_scripts_preview_ui"},
+        {label = "CHECK SCRIPTS", page = "script_targets",
+         hint = "Check again without loading. Flat and nested layouts work. Press A on a script to view its full source and target."},
+      }
+      local count = math.min(32, math.max(0, UIExpression.DvarInt(nil, "bo2zm_scripts_target_count_ui") or 0))
+      for i = 0, count - 1 do
+        local source = UIExpression.DvarString(nil, "bo2zm_scripts_source_" .. i .. "_ui") or ""
+        local target = UIExpression.DvarString(nil, "bo2zm_scripts_target_" .. i .. "_ui") or ""
+        table.insert(items, {label = "SCRIPT " .. (i + 1), action = "message",
+          hint = source .. " => " .. target .. ". Press A for details. Checking does not load scripts.",
+          message = "SOURCE\n" .. source .. "\n=> REPLACEMENT TARGET\n" .. target})
+      end
+      ExtrasPages.script_targets = items
+    elseif page == "script_issues" then
+      Engine.ExecNow(controller, "bo2zm_scripts_refresh")
+      local items = {
+        title = "SETUP ISSUES", parent = "scripts",
+        {label = "SCAN RESULT", textDvar = "bo2zm_scripts_scan_ui"},
+        {label = "REFRESH LIST", page = "script_issues",
+         hint = "Scan again for missing or invalid mod.ini files. Valid folders for another gamemode are not setup issues."},
+      }
+      local count = math.min(32, math.max(0, UIExpression.DvarInt(nil, "bo2zm_scripts_issue_count_ui") or 0))
+      for i = 0, count - 1 do
+        local issue = UIExpression.DvarString(nil, "bo2zm_scripts_issue_" .. i .. "_ui") or ""
+        table.insert(items, {label = "ISSUE " .. (i + 1), action = "message",
+          hint = issue .. ". Press A for details.", message = issue})
+      end
+      ExtrasPages.script_issues = items
+    end
+    local menu = Safely(ExtrasPages[page].custom and CreateWeaponsPage or CreatePage, controller, page)
+    if menu then
+      return menu
+    end
+    local popup = LUI.createMenu.Error(controller)
+    popup:setMessage("This page could not open.")
+    return popup
+  end
+end
+
+state.pageBuilders = {}
+for _, page in ipairs(PageNames) do
+  if state.zombies() or page == "main" or page == "scripts" or page == "script_targets" or page == "script_issues"
+      or page == "experimental" or page == "debug" or page == "purge" then
+    table.insert(state.pageBuilders, {PageMenuName(page), PageBuilder(page)})
+  end
+end
+
+
+local function AddExtrasButton(menu, priority)
+  local hint = state.zombies() and ExtrasHint or "Your username, experimental features and debug options."
+  local button = menu.buttonList:addButton("EXTRAS", hint, priority)
+  button:setActionEventName("bo2zm_open_extras")
+  menu:registerEventHandler("bo2zm_open_extras", Protect(function(self, event)
+    OpenPage(self, event.controller, "main")
+  end))
+  return button
+end
+
+
+local AddUpdatesButton
+do
+  local UpdatesButton = true
+  local UpdatesMenu = "Bo2zmUpdates"
+  local Checking, UpdateFound, Restarting = 1, 5, 6
+  local UpdatesHint = "Asks the update server for a newer build."
+  local UpdateButtons = {
+    install = {label = "DOWNLOAD AND RESTART", hint = "Restarts the game: the update downloads as it starts, with a "
+      .. "progress bar (B there skips it)."},
+    check = {label = "CHECK AGAIN", hint = "Asks the update server again."},
+  }
+
+  local function Split(text)
+    local parts = {}
+    for part in string.gmatch(text or "", "[^|]+") do
+      table.insert(parts, part)
+    end
+    return parts
+  end
+
+
+  local function AddLine(menu, top, height, width)
+    local line = LUI.UIText.new()
+    line:setLeftRight(true, false, 0, width)
+    line:setTopBottom(true, false, top, top + height)
+    line:setAlignment(LUI.Alignment.Left)
+    menu:addElement(line)
+    return line
+  end
+
+  local function CreateUpdates(controller)
+    local menu = CoD.Menu.New(UpdatesMenu)
+    menu:setOwner(controller)
+    menu:addTitle("CHECK FOR UPDATES")
+    menu:addLargePopupBackground()
+    menu.anyControllerAllowed = true
+    menu:addSelectButton()
+    menu:addBackButton()
+
+    local width = CoD.Options and CoD.Options.Width or CoD.ButtonList.DefaultWidth
+    local top = CoD.Menu.TitleHeight
+    local status = AddLine(menu, top, CoD.CoD9Button.TextHeight, width)
+    status:setFont(CoD.fonts.Condensed)
+    status:setRGB(CoD.trueOrange.r, CoD.trueOrange.g, CoD.trueOrange.b)
+
+    local lineRoom = 3 * (CoD.textSize.Default + 4)
+    local linesTop = top + CoD.CoD9Button.TextHeight + 12
+    local lines = {}
+    for i = 1, 3 do
+      lines[i] = AddLine(menu, linesTop + (i - 1) * lineRoom, CoD.textSize.Default, width)
+      lines[i]:setRGB(CoD.DefaultTextColor.r, CoD.DefaultTextColor.g, CoD.DefaultTextColor.b)
+    end
+    local listTop = linesTop + 3 * lineRoom + 10
+
+
+    local list, listKey
+    local function SetButtons(names)
+      local key = table.concat(names, " ")
+      if key == listKey then
+        return
+      end
+      listKey = key
+      if list then
+        list:close()
+        list = nil
+      end
+      if #names == 0 then
+        return
+      end
+      list = CoD.ButtonList.new()
+      list:setLeftRight(true, false, 0, width)
+      list:setTopBottom(true, false, listTop, listTop + 720)
+      menu:addElement(list)
+      local first
+      for _, name in ipairs(names) do
+        local button = list:addButton(UpdateButtons[name].label, UpdateButtons[name].hint)
+        button:setActionEventName("bo2zm_update_button")
+        button.bo2zmAction = name
+        first = first or button
+      end
+      first:processEvent({name = "gain_focus", controller = controller})
+    end
+
+    local shownText
+    local function Refresh()
+      local state = UIExpression.DvarInt(nil, "bo2zm_update_ui") or 0
+      local text = UIExpression.DvarString(nil, "bo2zm_update_text_ui") or ""
+      if state == 0 then
+        return
+      end
+      if text ~= shownText then
+        shownText = text
+        local parts = Split(text)
+        status:setText(parts[1] or "")
+        for i = 1, 3 do
+          lines[i]:setText(parts[i + 1] or "")
+        end
+      end
+      local names = {}
+      if state == UpdateFound and UIExpression.DvarInt(nil, "bo2zm_update_install_ui") == 1 then
+        table.insert(names, "install")
+      end
+      if state > Checking and state ~= Restarting then
+        table.insert(names, "check")
+      end
+      SetButtons(names)
+    end
+
+    menu:registerEventHandler("bo2zm_update_button", Protect(function(self, event)
+      Engine.ExecNow(event.controller or controller, "bo2zm_update " .. event.button.bo2zmAction)
+      Refresh()
+    end))
+    menu:addElement(LUI.UITimer.new(250, "bo2zm_update_refresh", false))
+    menu:registerEventHandler("bo2zm_update_refresh", Protect(Refresh))
+
+    local back = menu.m_eventHandlers and menu.m_eventHandlers.button_prompt_back
+    menu:registerEventHandler("button_prompt_back", function(self, event)
+      if UIExpression.DvarInt(nil, "bo2zm_update_ui") == Restarting then
+        return
+      end
+      Safely(Engine.ExecNow, event.controller or controller, "bo2zm_update cancel")
+      if back then
+        return back(self, event)
+      end
+      self:goBack(event.controller or controller)
+    end)
+
+    status:setText("Checking for updates")
+    Engine.ExecNow(controller, "bo2zm_update check")
+    return menu
+  end
+
+  table.insert(state.pageBuilders, {UpdatesMenu, function(controller)
+    local menu = Safely(CreateUpdates, controller)
+    if menu then
+      return menu
+    end
+    local popup = LUI.createMenu.Error(controller)
+    popup:setMessage("This screen could not open.")
+    return popup
+  end})
+
+
+  local function Place(element)
+    element:setTopBottom(false, true, element.bo2zmTop, element.bo2zmBottom)
+    if element.bo2zmLeft then
+      element:setLeftRight(true, false, element.bo2zmLeft, element.bo2zmRight)
+    end
+  end
+  local function Pin(element, top, bottom, left, right)
+    element.bo2zmTop, element.bo2zmBottom = top, bottom
+    element.bo2zmLeft, element.bo2zmRight = left, right
+    Place(element)
+    if element.bo2zmPinned then
+      return
+    end
+    element.bo2zmPinned = true
+    local animate = element.animateToState
+    element.animateToState = function(self, ...)
+      local a, b = animate(self, ...)
+      Place(self)
+      return a, b
+    end
+  end
+
+
+  local function FitFlyout(menu, flyout)
+    local list = flyout.buttonList
+    if not list then return end
+    local function Width(button)
+      local container = button and button.container
+      if container and type(container.textWidth) == "number" then return container.textWidth end
+      local text = button and button.labelString
+      if type(text) ~= "string" then return 0 end
+      local measure = rawget(_G, "GetTextDimensions")
+      if type(measure) == "function" then
+        local ok, _, _, right = pcall(measure, text, CoD.CoD9Button.Font, CoD.CoD9Button.TextHeight)
+        if ok and type(right) == "number" then return right end
+      end
+      return #text * CoD.CoD9Button.TextHeight * 0.5
+    end
+    local labels = math.max(Width(menu.systemLinkButton), Width(menu.localButton))
+    local buttons = math.max(Width(flyout.openSystemLinkButton), Width(flyout.openServerBrowserButton))
+    local child = flyout:getFirstChild()
+    while child do
+      local nextChild = child:getNextSibling()
+      if child ~= list then child:close() end
+      child = nextChild
+    end
+    local left = 6 + labels + 15
+    return {left, left + buttons + 12}
+  end
+
+  function AddUpdatesButton(menu)
+    local row, prompts = CoD.CoD9Button.Height, CoD.ButtonPrompt.Height
+    local top = -(row * (8 + (UpdatesButton and 2 or 1))) - prompts
+    Pin(menu.buttonList, top, -prompts)
+    local flyout = menu.systemLinkFlyoutContainer
+    if flyout then
+      local edges = Safely(FitFlyout, menu, flyout) or {}
+      Pin(flyout, top + row + 2, top + row + 2 + row * 2 + 2, edges[1], edges[2])
+    end
+    if not UpdatesButton then
+      return
+    end
+    local button = menu.buttonList:addButton("CHECK FOR UPDATES", UpdatesHint, 4)
+    button:setActionEventName("bo2zm_open_updates")
+    menu:registerEventHandler("bo2zm_open_updates", Protect(function(self, event)
+      self:openPopup(UpdatesMenu, event.controller)
+    end))
+  end
+
+
+end
+
+
+local OnlineMenu = "Bo2zmOnline"
+do
+  local Preparing, HostReady, JoinReady = 1, 2, 3
+  local OnlineButtons = {
+    host = {label = "HOST ONLINE GAME", hint = "Opens the router's ports and gives you a join code to share."},
+    join = {label = "JOIN WITH CODE", hint = "Type the code the host's screen shows."},
+    lobby = {label = "CONTINUE TO LOBBY", hint = "Opens your game's lobby; players join it with your code."},
+    find = {label = "FIND GAME", hint = "Looks for the host's game: the host must be in its lobby."},
+  }
+
+  local function Help()
+    local help = UIExpression.DvarString(nil, "bo2zm_online_help_ui") or ""
+    if help == "" then
+      help = "Can't connect? If UPnP and the relay both fail, the host can forward UDP ports 31000-31002 to their console."
+    end
+    return help
+  end
+
+
+  local function AddLine(menu, top, height, width, bottomAnchored)
+    local line = LUI.UIText.new()
+    line:setLeftRight(true, false, 0, width)
+    line:setTopBottom(not bottomAnchored, bottomAnchored == true, top, top + height)
+    line:setAlignment(LUI.Alignment.Left)
+    menu:addElement(line)
+    return line
+  end
+
+
+  state.onlineLine = function(menu, text)
+    if not (LUI.UIText and LUI.UIText.new) or menu.bo2zmOnlineLine then return end
+    local height = CoD.textSize and CoD.textSize.Default or 20
+    local prompts = CoD.ButtonPrompt and CoD.ButtonPrompt.Height or 30
+    local line = AddLine(menu, -(prompts + 2 + height), height, 1100, true)
+    line:setRGB(CoD.trueOrange.r, CoD.trueOrange.g, CoD.trueOrange.b)
+    line:setText(text)
+    menu.bo2zmOnlineLine = line
+  end
+
+  local function CreateOnline(controller)
+    local menu = CoD.Menu.New(OnlineMenu)
+    menu:setOwner(controller)
+    menu:addTitle(state.zombies() and "ZOMBIES MULTIPLAYER" or "MULTIPLAYER")
+    menu:addLargePopupBackground()
+    menu.anyControllerAllowed = true
+    menu:addSelectButton()
+    menu:addBackButton()
+
+    local width = CoD.Options and CoD.Options.Width or CoD.ButtonList.DefaultWidth
+    local top = CoD.Menu.TitleHeight
+    local status = AddLine(menu, top, CoD.CoD9Button.TextHeight, width)
+    status:setFont(CoD.fonts.Condensed)
+    status:setRGB(CoD.trueOrange.r, CoD.trueOrange.g, CoD.trueOrange.b)
+
+
+    local rowHeight = CoD.textSize.Default + 4
+    local linesTop = top + CoD.CoD9Button.TextHeight + 12
+    local maxSteps = 12
+    local lines = {}
+    for i = 1, maxSteps + 1 do
+      lines[i] = AddLine(menu, linesTop + (i - 1) * rowHeight, CoD.textSize.Default, width)
+      lines[i]:setRGB(CoD.DefaultTextColor.r, CoD.DefaultTextColor.g, CoD.DefaultTextColor.b)
+    end
+    local perRow = math.max(20, math.floor(width / (CoD.textSize.Default * 0.45)))
+    local listTop = linesTop + 4 * rowHeight
+    local list
+    local function Place(texts)
+      local y = linesTop
+      for i, line in ipairs(lines) do
+        local text = texts[i] or ""
+        if i == #lines then y = y + rowHeight / 2 end
+        line:setTopBottom(true, false, y, y + CoD.textSize.Default)
+        line:setText(text)
+        if text ~= "" then y = y + rowHeight * (string.len(text) > perRow and 2 or 1) end
+      end
+      listTop = y + 12
+      if list then list:setTopBottom(true, false, listTop, listTop + 720) end
+    end
+
+    local listKey
+    local function SetButtons(names)
+      local key = table.concat(names, " ")
+      if key == listKey then return end
+      listKey = key
+      if list then
+        list:close()
+        list = nil
+      end
+      if #names == 0 then return end
+      list = CoD.ButtonList.new()
+      list:setLeftRight(true, false, 0, width)
+      list:setTopBottom(true, false, listTop, listTop + 720)
+      menu:addElement(list)
+      local first
+      for _, name in ipairs(names) do
+        local button = list:addButton(OnlineButtons[name].label, OnlineButtons[name].hint)
+        button:setActionEventName("bo2zm_online_button")
+        button.bo2zmAction = name
+        first = first or button
+      end
+      first:processEvent({name = "gain_focus", controller = controller})
+    end
+    menu.bo2zmOnlineButtons = function() return list end
+
+    local shownText
+    local function Refresh()
+      local onlineState = UIExpression.DvarInt(nil, "bo2zm_online_ui") or 0
+
+      local texts = {}
+      local key = UIExpression.DvarString(nil, "bo2zm_online_text_ui") or ""
+      for i = 1, maxSteps do
+        texts[i] = UIExpression.DvarString(nil, "bo2zm_online_step" .. i .. "_ui") or ""
+        key = key .. "|" .. texts[i]
+      end
+      texts[maxSteps + 1] = Help()
+      key = key .. "|" .. texts[maxSteps + 1]
+      if key ~= shownText then
+        shownText = key
+        status:setText(UIExpression.DvarString(nil, "bo2zm_online_text_ui") or "")
+        Place(texts)
+      end
+      if onlineState == Preparing then
+        SetButtons({})
+      elseif onlineState == HostReady then
+        SetButtons({"lobby", "join"})
+      elseif onlineState == JoinReady then
+        SetButtons({"find", "join", "host"})
+      else
+        SetButtons({"host", "join"})
+      end
+    end
+
+
+    local function OpenGame(self, event, field, stockName)
+      local home = self.bo2zmHome
+      local c = event.controller or controller
+      if self.goBack then self:goBack(c) else self:close() end
+      local stock = home and home.bo2zmOnlineStock and home.bo2zmOnlineStock[field]
+      local mainMenu = CoD.MainMenu
+      stock = stock or (mainMenu and mainMenu[stockName])
+      if home and stock then
+        stock(home, {name = field, controller = c})
+      else
+        Log("online: the home menu's " .. stockName .. " is missing")
+      end
+    end
+
+    menu:registerEventHandler("bo2zm_online_button", Protect(function(self, event)
+      local action = event.button and event.button.bo2zmAction
+      if action == "lobby" then
+        return OpenGame(self, event, "lobby", "OpenSystemLinkLobby")
+      elseif action == "find" then
+        return OpenGame(self, event, "browser", "OpenServerBrowser")
+      elseif action then
+        Engine.ExecNow(event.controller or controller, "bo2zm_online " .. action)
+      end
+      Refresh()
+    end))
+    menu:addElement(LUI.UITimer.new(250, "bo2zm_online_refresh", false))
+    menu:registerEventHandler("bo2zm_online_refresh", Protect(Refresh))
+    local back = menu.m_eventHandlers and menu.m_eventHandlers.button_prompt_back
+    menu:registerEventHandler("button_prompt_back", function(self, event)
+      if UIExpression.DvarInt(nil, "bo2zm_online_ui") == Preparing then
+        Safely(Engine.ExecNow, event.controller or controller, "bo2zm_online cancel")
+      end
+      if back then return back(self, event) end
+      if self.goBack then self:goBack(event.controller or controller) else self:close() end
+    end)
+    Refresh()
+    return menu
+  end
+
+  table.insert(state.pageBuilders, {OnlineMenu, function(controller)
+    local menu = Safely(CreateOnline, controller)
+    if menu then return menu end
+    local popup = LUI.createMenu.Error(controller)
+    popup:setMessage("This screen could not open.")
+    return popup
+  end})
+
+
+  state.onlineBrowser = function(menu)
+    if UIExpression.DvarInt(nil, "bo2zm_online_ui") == JoinReady then
+      state.onlineLine(menu, "Joining " .. (UIExpression.DvarString(nil, "bo2zm_online_code_ui") or "") .. ". "
+        .. Help())
+    end
+  end
+
+
+  state.onlineTitled = function(original)
+    return function(controller, ...)
+      local menu = original(controller, ...)
+      local online = UIExpression.DvarInt(nil, "bo2zm_online_ui")
+      if menu and (online == HostReady or online == JoinReady) then
+        Safely(state.retitle, menu)
+      end
+      return menu
+    end
+  end
+  state.retitle = function(menu)
+    if menu.bo2zmRetitled or type(menu.setTitle) ~= "function" then return end
+    menu.bo2zmRetitled = true
+    local title = state.zombies() and "ZOMBIES MULTIPLAYER" or "MULTIPLAYER"
+    local stock = {["SYSTEM LINK"] = true, ["SYSTEM LINK GAMES"] = true}
+    for _, key in ipairs({"PLATFORM_SYSTEM_LINK_CAPS", "PLATFORM_SYSTEM_LINK_GAMES_CAPS"}) do
+      local ok, text = pcall(Engine.Localize, key)
+      if ok and type(text) == "string" then stock[text] = true end
+    end
+    local function Retitle(text)
+      if type(text) == "string" and (stock[text] or stock[string.upper(text)]) then return title end
+      return text
+    end
+    local setTitle = menu.setTitle
+    menu.setTitle = function(self, text, ...)
+      return setTitle(self, Retitle(text), ...)
+    end
+    local panels = menu.panelManager and menu.panelManager.panels
+    if type(panels) == "table" then
+      for _, pane in pairs(panels) do
+        if pane.titleText ~= nil then pane.titleText = Retitle(pane.titleText) end
+      end
+    end
+    if menu.titleElement then
+      menu:setTitle(menu.titleText or title)
+    end
+    Log("online: " .. tostring(menu.menuName or "menu") .. " titled " .. title)
+  end
+  state.onlineLobby = function(menu)
+    if UIExpression.DvarInt(nil, "bo2zm_online_ui") == HostReady then
+      state.onlineLine(menu, "JOIN CODE " .. (UIExpression.DvarString(nil, "bo2zm_online_code_ui") or "") .. ". "
+        .. Help())
+    end
+  end
+end
+
+local function FixSoloButton(menu)
+  local solo = menu.mainLobbyButton
+  if not solo then
+    return
+  end
+  solo:setLabel("LOCAL")
+  solo.hintText = menu.bo2zmSoloHint
+  solo:setActionEventName("open_local_match_lobby")
+  if solo.disabled then
+    solo.disabled = nil
+    solo:animateToState("default")
+  end
+end
+
+local function PatchMainMenu(menu, controller)
+  local localButton = menu.localButton
+  if localButton then
+    menu.bo2zmSoloHint = localButton.hintText
+    localButton:setLabel(state.zombies() and "ZOMBIES MULTIPLAYER" or "MULTIPLAYER")
+    localButton.hintText = "Play over the internet: host a game with a join code, or join one."
+    localButton:setActionEventName("bo2zm_open_online")
+  end
+  FixSoloButton(menu)
+  Refocus(menu.mainLobbyButton, controller)
+
+  OnEvent(menu, "first_signed_in", FixSoloButton, true)
+  OnEvent(menu, "last_signed_out", FixSoloButton, true)
+
+  menu:registerEventHandler("bo2zm_open_online", Protect(function(self, event)
+    local popup = self:openPopup(OnlineMenu, event.controller)
+    if popup then popup.bo2zmHome = self end
+  end))
+
+
+  local handlers = menu.m_eventHandlers or {}
+  menu.bo2zmOnlineStock = {lobby = handlers.open_system_link_lobby, browser = handlers.open_server_browser}
+  for field, name in pairs({lobby = "open_system_link_lobby", browser = "open_server_browser"}) do
+    local stock = menu.bo2zmOnlineStock[field]
+    if stock then
+      menu:registerEventHandler(name, function(self, event)
+        Safely(Engine.ExecNow, event.controller or controller, "bo2zm_online off")
+        return stock(self, event)
+      end)
+    end
+  end
+
+  AddExtrasButton(menu, 4)
+  AddUpdatesButton(menu)
+
+
+  local CoDTable = rawget(_G, "CoD")
+  local stockBack = CoDTable and CoDTable.MainMenu and CoDTable.MainMenu.Back
+  local leaveModes = {start_sp = "cp", start_mp = "mp", start_zombies = "zm"}
+  local function HomeBack(self, event)
+    if not (stockBack and state.otherModeInstalled()) then
+      return
+    end
+    local own = self.openPopup
+    self.openPopup = function(home, name, popupController, options, ...)
+      home.openPopup = own
+      if name == "ConfirmLeave" and type(options) == "table" and type(options.params) == "table" then
+        local kept = {}
+        for _, entry in ipairs(options.params) do
+          local mode = type(entry) == "table" and leaveModes[entry.leaveEvent]
+          if not mode or state.modeInstalled(mode) then table.insert(kept, entry) end
+        end
+        options.params = kept
+      end
+      return home:openPopup(name, popupController, options, ...)
+    end
+    local ok, a, b = pcall(stockBack, self, event)
+    self.openPopup = own
+    if not ok then error(a, 0) end
+    return a, b
+  end
+  local register = menu.registerEventHandler
+  menu.registerEventHandler = function(self, name, handler, ...)
+    if name ~= "button_prompt_back" or handler ~= stockBack or not stockBack then
+      return register(self, name, handler, ...)
+    end
+    local a, b = register(self, name, HomeBack, ...)
+    if not state.otherModeInstalled() then
+      CloseField(self, "backButton")
+    end
+    return a, b
+  end
+  for field, mode in pairs({spButton = "cp", mpButton = "mp", zombieButton = "zm"}) do
+    if not state.modeInstalled(mode) then CloseField(menu, field) end
+  end
+  local current = menu.m_eventHandlers and menu.m_eventHandlers.button_prompt_back
+  if stockBack and current == stockBack then
+    menu:registerEventHandler("button_prompt_back", stockBack)
+  end
+end
+
+
+local function AddMarkLocationButton(menu)
+  if UIExpression.DvarInt(nil, "bo2zm_mark_location_ui") ~= 1 or UIExpression.DvarInt(nil, "bo2zm_dbg_ui") ~= 1 then
+    return
+  end
+  local button = menu.buttonList:addButton("MARK LOCATION", nil, -1)
+  button:setActionEventName("bo2zm_mark_here")
+  menu:registerEventHandler("bo2zm_mark_here", Protect(function(self, event)
+    local controller = event.controller or 0
+    Engine.ExecNow(controller, "bo2zm_mark_here")
+    self:processEvent({name = "button_prompt_back", controller = controller})
+  end))
+end
+
+local WrapPauseAddButton;
+(function()
+
+
+  function state.primaryController(controller)
+    if not state.validController(controller) or type(UIExpression.IsPrimaryLocalClient) ~= "function" then return false end
+    local known, primary = pcall(UIExpression.IsPrimaryLocalClient, controller)
+    return known and (primary == 1 or primary == true)
+  end
+  local function IsPauseLeader(menu, event, timer)
+    if not menu or type(menu.getOwner) ~= "function"
+        or type(UIExpression.IsPrimaryLocalClient) ~= "function" then return false end
+    local ok, owner = pcall(menu.getOwner, menu)
+    if not ok or type(owner) ~= "number" or owner < 0 or owner > 3 or owner % 1 ~= 0 then return false end
+    if event and event.controller ~= nil then
+      if event.controller ~= owner then return false end
+    elseif event ~= nil and not timer then
+      return false
+    end
+    return state.primaryController(owner)
+  end
+
+  local function Guard(original, timer)
+    return function(menu, event, ...)
+      if type(event) == "table" and IsPauseLeader(menu, event, timer) then return original(menu, event, ...) end
+    end
+  end
+
+  WrapPauseAddButton = function(original)
+    return function(menu, label, event, ...)
+      if (event == "open_endGamePopup" or event == "openRestartGamePopup") and not IsPauseLeader(menu) then
+        return
+      end
+      local button = original(menu, label, event, ...)
+      if event == "open_options" then
+        Safely(AddExtrasButton, menu)
+        Safely(AddMarkLocationButton, menu)
+      end
+      return button
+    end
+  end
+
+  state.installHostPause = function(wrap, createMenu, cod)
+    for _, entry in ipairs({
+      {cod.Class, {"EndGameButtonPressed", "RestartGameButtonPressed"}},
+      {cod.EndGamePopup, {"YesButtonPressed", "FinishEndGame"}},
+      {cod.RestartGamePopup, {"YesButtonPressed", "CancelUpload"}},
+    }) do
+      for _, name in ipairs(entry[2]) do wrap(entry[1], name, Guard) end
+    end
+
+    for _, name in ipairs({"WaitForDemostream", "RestartLevel"}) do
+      wrap(cod.RestartGamePopup, name, function(original) return Guard(original, true) end)
+    end
+
+    for name, events in pairs({
+      class = {open_endGamePopup = false, openRestartGamePopup = false},
+      EndGamePopup = {endGamePopup_YesButtonPressed = false},
+      RestartGamePopup = {restartGamePopup_YesButtonPressed = false, cancelUpload = false, waitForDemoStream = true},
+    }) do
+      wrap(createMenu, name, function(original)
+        return function(...)
+          local menu = original(...)
+          if menu and menu.m_eventHandlers then
+            for event, timer in pairs(events) do
+              local handler = menu.m_eventHandlers[event]
+              if type(handler) == "function" then menu:registerEventHandler(event, Guard(handler, timer)) end
+            end
+          end
+          return menu
+        end
+      end)
+    end
+  end
+end)()
+
+
+local function SteadyButton(button)
+  if not button or button.bo2zmSteady then
+    return
+  end
+  button.bo2zmSteady = true
+  local enable, disable = button.enable, button.disable
+  button.enable = function(self, ...)
+    if self.disabled then
+      return enable(self, ...)
+    end
+  end
+  button.disable = function(self, ...)
+    if not self.disabled then
+      return disable(self, ...)
+    end
+  end
+
+  for event, handler in pairs(button.m_eventHandlers or {}) do
+    if handler == enable then
+      button:registerEventHandler(event, button.enable)
+    elseif handler == disable then
+      button:registerEventHandler(event, button.disable)
+    end
+  end
+end
+
+local function WrapSteadyButtonNew(original)
+  return function(...)
+    local button = original(...)
+    Safely(SteadyButton, button)
+    return button
+  end
+end
+
+
+local function ClearStartMatchHint(pane)
+  local body = pane and pane.body
+  local button = body and body.startMatchButton
+  if not button then return end
+  local function Clear(self)
+    if self.hintText == Engine.Localize("MPUI_START_MATCH_DESC") then self.hintText = nil end
+    local list = body.buttonList
+    if self:isInFocus() and list and list.updateHintText then list:updateHintText(self) end
+  end
+  if not button.bo2zmStartHint then
+    button.bo2zmStartHint = true
+    OnEvent(button, "gamelobby_update", Clear, true)
+    OnEvent(button, "gain_focus", Clear, true)
+    OnEvent(button, "start_game", Clear, true)
+  end
+  Clear(button)
+end
+
+
+local PatchBotsLobby
+;(function()
+
+
+  local labelSpan = 220
+  local function AlignChoices(selector, list)
+    local label = selector.label
+    if not label or not selector.horizontalList then return end
+    local left, _, right = label:getRect()
+    if not left or not right or right <= left then return end
+    local stock = list:getFirstChild()
+    while stock do
+      local control = stock.leftArrow or stock.choiceText
+      if stock.m_settingName and control then
+        local column = control:getRect()
+        if column and column > left then
+
+          column = (column - left) * labelSpan / (right - left)
+          if selector.bo2zmChoiceColumn ~= column then
+            selector.bo2zmChoiceColumn = column
+            selector.horizontalList:setLeftRight(true, true, column, 0)
+            selector.horizontalList:setLayoutCached(false)
+          end
+          return
+        end
+      end
+      stock = stock:getNextSibling()
+    end
+  end
+
+  local function Context()
+    local map = UIExpression.DvarString(nil, "ui_mapname") or ""
+    local gametype = UIExpression.DvarString(nil, "ui_gametype") or ""
+    local start = UIExpression.DvarString(nil, "ui_zm_mapstartlocation") or ""
+    local function Token(value, limit)
+      return #value > 0 and #value <= limit and string.match(value, "^[a-z0-9_]+$") ~= nil
+    end
+    if string.sub(map, 1, 3) ~= "zm_" or map == "zm_frontend" or #map <= 3 or not Token(map, 48)
+        or not Token(gametype, 32) or (start ~= "" and not Token(start, 48)) then
+      return nil
+    end
+    return map .. " " .. gametype .. " " .. (start == "" and "-" or start)
+  end
+
+
+  local function Hosting(menu, controller)
+    local lobby = CoD.PrivateGameLobby
+    if not lobby or type(lobby.IsHost) ~= "function" then return false end
+    local ok, host = pcall(lobby.IsHost, menu, controller)
+    return ok and host == true
+  end
+
+  local function ReportPlayers(menu, controller)
+    local ok, players = pcall(Engine.PartyGetPlayerCount)
+    players = ok and tonumber(players) or nil
+    if not players or players ~= math.floor(players) then return end
+    players = math.max(1, math.min(4, players))
+    if menu.bo2zmPlayers ~= players then
+      menu.bo2zmPlayers = players
+      Engine.ExecNow(controller, "bo2zm_bots_humans " .. tostring(players))
+    end
+  end
+
+  local function Refresh(menu, controller)
+    if not state.zombies() or InGame() then return end
+    local pane = menu.buttonPane
+    local body = pane and pane.body
+    local list = body and body.buttonList
+    if not list or not list.addDvarLeftRightSelector then return end
+    if menu.bo2zmSystemLink then
+      if not Hosting(menu, controller) then
+        if body.bo2zmBotCount then
+          body.bo2zmBotCount:close()
+          body.bo2zmBotCount = nil
+        end
+        return
+      end
+      ReportPlayers(menu, controller)
+    end
+    local context = Context()
+    if context then Engine.ExecNow(controller, "bo2zm_bots_context " .. context) end
+    if not body.bo2zmBotCount then
+      local selector = list:addDvarLeftRightSelector(controller, "BOT COUNT", "bo2zm_bots_count_ui", "", 170)
+      body.bo2zmBotCount = selector
+
+      if selector.label and selector.horizontalList then
+        selector.horizontalList:removeElement(selector.label)
+        selector:addElement(selector.label)
+        selector.label:setLeftRight(true, false, 0, labelSpan)
+        selector.horizontalList:setLeftRight(true, true, labelSpan, 0)
+      end
+      SteadyButton(selector)
+      selector:registerEventHandler("start_game", selector.disable)
+      selector:registerEventHandler("cancel_start_game", selector.enable)
+    end
+    local selector = body.bo2zmBotCount
+    local installed = UIExpression.DvarInt(nil, "bo2zm_bots_available_ui") == 1
+    local maximum = math.max(0, math.min(3, UIExpression.DvarInt(nil, "bo2zm_bots_max_ui")))
+    if selector.bo2zmInstalled ~= installed or selector.bo2zmMaximum ~= maximum then
+      selector.bo2zmInstalled = installed
+      selector.bo2zmMaximum = maximum
+      selector:clearChoices()
+      selector.m_currentChoice = nil
+      selector.m_lastChoice = nil
+      if installed then
+        for count = 0, maximum do
+          local label = count == 0 and "OFF" or tostring(count)
+          selector:addChoice(controller, label, count, nil, Protect(function(params, userRequested)
+            if userRequested then
+              local current = Context()
+              if not state.zombies() or InGame() or not current
+                  or UIExpression.DvarInt(nil, "bo2zm_bots_available_ui") ~= 1
+                  or count > UIExpression.DvarInt(nil, "bo2zm_bots_max_ui") then return false end
+              Engine.ExecNow(controller, "bo2zm_bots_count " .. current .. " " .. tostring(count))
+              return UIExpression.DvarInt(nil, "bo2zm_bots_count_ui") == count
+            end
+          end))
+        end
+      else
+        selector:addChoice(controller, "NOT INSTALLED", -1, nil, function() end)
+      end
+      ApplyStatus(selector, {status = not installed or maximum == 0})
+      selector:refreshChoice()
+      selector:updateChoice(false)
+    end
+    local hint = installed and "Bots join next match." or "Install bot files to enable."
+    if installed and maximum == 0 then hint = "All player slots are in use." end
+    if installed and not context then hint = "Choose a map first." end
+    local detail = UIExpression.DvarString(nil, "bo2zm_bots_status_ui") or ""
+    if installed and string.find(detail, "Bots unavailable:", 1, true) then
+      hint = "Unavailable with this mod."
+    end
+    selector.hintText = hint
+    selector:refreshChoice()
+    AlignChoices(selector, list)
+  end
+
+  function PatchBotsLobby(menu, controller, systemLink)
+    if not state.zombies() or InGame() then return end
+    controller = controller or 0
+    if menu.buttonPane then menu.buttonPane.bo2zmBotMenu = menu end
+    if not menu.bo2zmBotTimer then
+      menu.bo2zmBotTimer = true
+      menu.bo2zmSystemLink = systemLink == true
+      menu.bo2zmPlayers = nil
+      Engine.ExecNow(controller, "bo2zm_bots_open")
+      menu.bo2zmBotController = controller
+      menu:addElement(LUI.UITimer.new(250, "bo2zm_refresh_bots", false))
+      OnEvent(menu, "bo2zm_refresh_bots", function(self) Refresh(self, controller) end, true)
+    end
+    Refresh(menu, controller)
+  end
+end)()
+
+local function WrapLobbyPopulate(original)
+  return function(pane, ...)
+    local restoreBotFocus = pane and pane.body and pane.body.bo2zmBotCount
+        and pane.body.bo2zmBotCount:isInFocus()
+    if pane and pane.bo2zmBotMenu and pane.body then
+      pane.body.bo2zmBotCount = nil
+    end
+    local a, b = original(pane, ...)
+    if pane and pane.body then
+      Safely(SteadyButton, pane.body.startMatchButton)
+      local list = pane.body.buttonList
+      local button = list and list:getFirstChild()
+      while button do
+        if type(button.enable) == "function" and type(button.disable) == "function" then
+          Safely(SteadyButton, button)
+        end
+        button = button:getNextSibling()
+      end
+      ClearStartMatchHint(pane)
+      if pane.bo2zmBotMenu then
+        Safely(PatchBotsLobby, pane.bo2zmBotMenu, pane.bo2zmBotMenu.bo2zmBotController)
+        if restoreBotFocus and pane.body.bo2zmBotCount and pane.body.bo2zmBotCount:isFocusable() then
+          local controller = pane.bo2zmBotMenu.bo2zmBotController
+          local focused = list and list:getFirstChild()
+          while focused do
+            if type(focused.isInFocus) == "function" and focused:isInFocus() then
+              focused:processEvent({name = "lose_focus", controller = controller})
+            end
+            focused = focused:getNextSibling()
+          end
+          pane.body.bo2zmBotCount:processEvent({name = "gain_focus", controller = controller})
+        end
+      end
+    end
+    return a, b
+  end
+end
+
+
+local function PatchGraphicsSettings(menu, controller)
+  CloseField(menu, "safeAreaButton")
+  CloseField(menu, "stereoscopic3dButton")
+  CloseField(menu, "dualViewButton")
+
+  menu:registerEventHandler("update_buttonlist", function(self, event)
+  end)
+
+  local preset = menu.anaglyphButton
+  if preset then
+    preset:setLabel(PresetItem.label)
+    preset.hintText = PresetItem.hint
+    preset.m_dvarName = ItemDvar(PresetItem)
+    preset:clearChoices()
+    preset.m_currentChoice = nil
+    preset.m_lastChoice = nil
+    preset.currentValue = preset:getCurrentValue()
+    AddChoices(menu, preset, controller, PresetItem)
+    if preset.disabled then
+      preset.disabled = nil
+      preset:animateToState("default")
+    end
+    local list = preset:getParent()
+    if list and list.addDvarLeftRightSelector and not menu.bo2zmAdded then
+      menu.bo2zmAdded = true
+      local function Add(item)
+        local selector = list:addDvarLeftRightSelector(controller, item.label, ItemDvar(item), item.hint)
+        AddChoices(menu, selector, controller, item)
+        ApplyStatus(selector, item)
+        return selector
+      end
+      AddHeading(list, "CUSTOM SETTINGS")
+      for _, item in ipairs(GraphicsItems) do
+        if item.setting == "gfx_distance" and not state.zombies() then
+          Add({label = item.label, setting = item.setting, choices = item.choices,
+               hint = "How far the world is drawn. Shorter distances improve frame rate but hide distant scenery. "
+                 .. "FAR OBJECTS on SIMPLE keeps large distant shapes visible."})
+        else
+          Add(item)
+        end
+      end
+      AddHeading(list, "DISPLAY")
+      Add(FpsCapItem)
+      Add(VsyncItem)
+      Add(ShowPresetItem)
+      Add(FpsCounterItem)
+
+      if list.addElementToTop and list.removeElement then
+        local top = {}
+        local profileItems = InGame() and {ProfileInUseItem, EnableProfileGameItem}
+                               or {MapProfileItem, EnableProfileItem}
+        if not state.zombies() then
+          profileItems = {
+            {label = "PROFILE IN USE", setting = "profile", choices = {"GLOBAL"}, status = true},
+            {label = "ENABLE PROFILE", setting = "profile_on", choices = {"OFF", "ON", "N/A"}, status = true},
+          }
+        end
+        for _, item in ipairs(profileItems) do
+          table.insert(top, Add(item))
+        end
+        for i = #top, 1, -1 do
+          if top[i] then
+            list:removeElement(top[i])
+            list:addElementToTop(top[i])
+          end
+        end
+      end
+
+
+      FitList(menu, list, 0, CoD.Options and CoD.Options.Width or CoD.ButtonList.DefaultWidth)
+    end
+  end
+
+  if menu.brightnessButton then
+    menu.brightnessButton:processEvent({name = "gain_focus", controller = controller})
+  end
+end
+
+
+local function PatchOptions(menu, controller)
+  local graphics = menu.graphicsSettingsButton
+  local list = menu.buttonList
+  if not graphics or not list or not list.addElementToTop or list:getFirstChild() == graphics then
+    return
+  end
+
+  local child = list:getFirstChild()
+  while child do
+    if child ~= graphics and child.isInFocus and child:isInFocus() then
+      child:processEvent({name = "lose_focus", controller = controller})
+    end
+    child = child:getNextSibling()
+  end
+  list:removeElement(graphics)
+  list:addElementToTop(graphics)
+  graphics:processEvent({name = "gain_focus", controller = controller})
+end
+
+
+local function HudHiddenPicked(controller)
+  return state.zombies() and state.validController(controller)
+    and UIExpression.DvarInt(nil, state.playerDvar("hud", controller)) == 1
+    and UIExpression.DvarInt(nil, state.playerDvar("cheats", controller)) == 1
+end
+
+local function SetHudHidden(menu, hidden)
+  if hidden then
+    local controller = state.pageController(menu, nil)
+    if controller ~= nil then
+      state.hudWasHidden = state.hudWasHidden or {}
+      state.hudWasHidden[controller] = true
+    end
+    menu:setAlpha(0)
+    if not menu.bo2zmHidden then
+      menu.bo2zmHidden = true
+      Log("match HUD hidden")
+    end
+  elseif menu.bo2zmHidden then
+    menu:setAlpha(1)
+    menu.bo2zmHidden = nil
+    Log("match HUD shown")
+  end
+end
+
+local function PatchHud(menu, controller)
+  if menu.bo2zmHud then
+    SetHudHidden(menu, HudHiddenPicked(state.pageController(menu, nil)))
+    return
+  end
+  menu.bo2zmHud = true
+  Log("match HUD: hiding ready")
+  menu:addElement(LUI.UITimer.new(250, "bo2zm_hud_check", false))
+  menu:registerEventHandler("bo2zm_hud_check", Protect(function(self, event)
+
+    SetHudHidden(self, HudHiddenPicked(state.pageController(self, nil)))
+  end))
+  SetHudHidden(menu, HudHiddenPicked(state.pageController(menu, nil)))
+end
+
+
+local function ApplyHudUnder(element, depth, where, controller, hidden)
+  local child = element:getFirstChild()
+  while child do
+    if child.menuName == "HUD" then
+      local owner = state.pageController(child, nil)
+      if owner ~= nil and (controller == nil or owner == controller) then
+        if not child.bo2zmHud then
+          Log("match HUD found under " .. where)
+        end
+
+        PatchHud(child)
+        SetHudHidden(child, hidden == nil and HudHiddenPicked(owner) or hidden)
+      end
+    elseif depth > 1 then
+      ApplyHudUnder(child, depth - 1, where, controller, hidden)
+    end
+    child = child:getNextSibling()
+  end
+end
+
+local HudRoots = {"UIRoot0", "UIRoot1", "UIRoot2", "UIRoot3", "UIRootFull"}
+
+local function ApplyHud(controller, hidden)
+  local roots = LUI.roots
+  if not roots then
+    return
+  end
+  for _, name in ipairs(HudRoots) do
+    local root = roots[name]
+    if root then
+      ApplyHudUnder(root, 3, name, controller, hidden)
+    end
+  end
+end
+state.applyHud = ApplyHud
+
+local function WrapNewFromState(original)
+  return function(name, ...)
+    local menu = original(name, ...)
+    if name == "HUD" and menu then
+      Safely(PatchHud, menu)
+    end
+    return menu
+  end
+end
+
+
+local PatchMainMenuForTests, TestPickMap, TestStartMatch
+do
+  local function TestSpec()
+    local spec = UIExpression.DvarString(nil, "bo2zm_test_start_ui")
+    if spec == nil or spec == "" then
+      return nil
+    end
+    if not state.zombies() then
+      local map, gametype = string.match(spec, "^(mp_%S+) (%S+)$")
+      if not map then
+        return nil
+      end
+      return {spec = spec, map = map, gametype = gametype}
+    end
+    local map, location, gametype, group = string.match(spec, "^(%S+) (%S+) (%S+) (%S+)$")
+    if not map then
+      Log("test start: expected a map, start location, game type and mode group, not " .. spec)
+      return nil
+    end
+    return {spec = spec, map = map, location = location, gametype = gametype, group = group}
+  end
+
+  local function SetTestMatch(controller, t)
+    Engine.Exec(controller, "resetCustomGametype")
+    Engine.SetGametype(t.gametype)
+    Engine.SetDvar("ui_gametype", t.gametype)
+    if t.group then
+      Engine.SetDvar("ui_zm_gamemodegroup", t.group)
+      Engine.SetDvar("ui_zm_mapstartlocation", t.location)
+    end
+    Engine.SetDvar("ui_mapname", t.map)
+    Engine.Exec(controller, "xupdatepartystate")
+  end
+
+
+  local function TestStep(menu, controller, flag, f)
+    local t = TestSpec()
+    if not t or state[flag] then
+      return
+    end
+    state[flag] = true
+    local event = "bo2zm_" .. flag
+    menu:addElement(LUI.UITimer.new(1500, event, true))
+    menu:registerEventHandler(event, Protect(function(self, e)
+      if state[flag .. "Done"] then
+        return
+      end
+      state[flag .. "Done"] = true
+      f(self, controller, t)
+    end))
+  end
+
+
+  local function TestOpenSolo(menu, controller)
+    TestStep(menu, controller, "testSolo", function(self, c, t)
+      local requested = tonumber(UIExpression.DvarString(nil, "bo2zm_test_start_controller"))
+      if requested and requested >= 0 and requested <= 3 and requested == math.floor(requested) then
+        c = requested
+      end
+      self:processEvent({name = "open_local_match_lobby", controller = c})
+      Log("test start: local lobby opened by controller " .. tostring(c))
+    end)
+  end
+
+  function PatchMainMenuForTests(menu, controller)
+    PatchMainMenu(menu, controller)
+    TestOpenSolo(menu, controller)
+  end
+
+  function TestPickMap(menu, controller)
+    TestStep(menu, controller, "testPicked", function(self, c, t)
+      SetTestMatch(c, t)
+      local lobby = self:openMenu("SplitscreenGameLobby", c)
+      if lobby then
+        lobby:setPreviousMenu("MainMenu")
+      end
+      self:close()
+      Log("test start: " .. t.spec .. " picked")
+    end)
+  end
+
+  function TestStartMatch(menu, controller)
+    ClearStartMatchHint(menu.buttonPane)
+    PatchBotsLobby(menu, controller)
+
+    if UIExpression.DvarInt(nil, "bo2zm_test_lobby_only") == 1 then return end
+    TestStep(menu, controller, "testStarted", function(self, c, t)
+      SetTestMatch(c, t)
+      Engine.PartyHostToggleStart()
+      Log("test start: " .. t.spec .. " started")
+    end)
+  end
+end
+
+
+local function WrapLoading(original)
+  return function(controller, ...)
+
+    Safely(function()
+      Engine.ExecNow(controller or 0, "bo2zm_profile_map " .. UIExpression.DvarString(nil, "ui_mapname") .. " "
+        .. UIExpression.DvarString(nil, "ui_gametype") .. " "
+        .. UIExpression.DvarString(nil, "ui_zm_mapstartlocation"))
+    end)
+    local CoD = rawget(_G, "CoD")
+    local zombie = CoD and CoD.Zombie
+    if not zombie or UIExpression.DvarString(nil, "bo2zm_loading_video_ui") ~= "0" then
+      return original(controller, ...)
+    end
+    local zclassic = zombie.GAMETYPE_ZCLASSIC
+    zombie.GAMETYPE_ZCLASSIC = "bo2zm_no_loading_video"
+    local ok, menu = pcall(original, controller, ...)
+    zombie.GAMETYPE_ZCLASSIC = zclassic
+    if not ok then
+      error(menu, 0)
+    end
+    Log("loading screen: the map's image (LOADING SCREEN VIDEO off)")
+    return menu
+  end
+end
+
+
+local PatchCampaignMenu, PatchCampaignPause, WrapCampaignPauseAddButton
+do
+  local CampaignExtrasHint = "Your username, experimental features and debug options."
+
+  local function OpenExtrasOn(menu)
+    menu:registerEventHandler("bo2zm_open_extras", Protect(function(self, event)
+      OpenPage(self, event.controller, "main")
+    end))
+  end
+
+  function PatchCampaignMenu(menu, controller)
+    if menu.bo2zmExtras then
+      return
+    end
+    if menu.carousel and CoD.NavButton then
+      local button = CoD.NavButton.new(nil, "EXTRAS", "bo2zm_open_extras")
+      button:setupCarouselMode()
+      menu.carousel:addItem(button)
+      menu.bo2zmExtras = button
+    else
+      local child = menu:getFirstChild()
+      while child do
+        if child.addNavButton then
+          menu.bo2zmExtras = child:addNavButton("EXTRAS", "bo2zm_open_extras")
+          break
+        end
+        child = child:getNextSibling()
+      end
+    end
+    if menu.bo2zmExtras then
+      menu.bo2zmExtras.hintText = CampaignExtrasHint
+      OpenExtrasOn(menu)
+    end
+  end
+
+  function PatchCampaignPause(menu, controller)
+    OpenExtrasOn(menu)
+  end
+
+
+  local CampaignHomeModes = {open_multiplayer = "mp", open_zombies = "zm"}
+  local function Dropped(button)
+    local mode = type(button) == "table" and CampaignHomeModes[button.actionEventName]
+    return mode and not state.modeInstalled(mode)
+  end
+  local function FixCampaignHome(menu, positions, seen)
+    local carousel = menu.carousel
+    if carousel and #positions < seen and type(carousel.getCurrentItemIndex) == "function" then
+      local current = carousel.getCurrentItemIndex
+      carousel.getCurrentItemIndex = function(self, ...)
+        local index = current(self, ...)
+        return positions[index] or index
+      end
+    end
+    local child = menu:getFirstChild()
+    while child do
+      if child.addNavButton then
+        local button = child:getFirstChild()
+        while button do
+          local nextButton = button:getNextSibling()
+          if Dropped(button) then button:close() end
+          button = nextButton
+        end
+      end
+      child = child:getNextSibling()
+    end
+  end
+  state.wrapCampaignHome = function(original)
+    return function(controller, ...)
+      local carouselClass = CoD.VerticalCarousel
+      local common = CoD.CarouselCommon
+      if not (carouselClass and common and type(carouselClass.AddItem) == "function"
+              and type(common.SetStartItem) == "function") then
+        local menu = original(controller, ...)
+        if menu then Safely(FixCampaignHome, menu, {}, 0) end
+        return menu
+      end
+      local add, start = carouselClass.AddItem, common.SetStartItem
+      local positions, seen = {}, 0
+      carouselClass.AddItem = function(self, item, ...)
+        seen = seen + 1
+        if Dropped(item) then return nil end
+        table.insert(positions, seen)
+        return add(self, item, ...)
+      end
+      common.SetStartItem = function(self, index, ...)
+        for kept, position in ipairs(positions) do
+          if position == index then
+            index = kept
+            break
+          end
+        end
+        return start(self, index, ...)
+      end
+      local ok, menu = pcall(original, controller, ...)
+      carouselClass.AddItem, common.SetStartItem = add, start
+      if not ok then error(menu, 0) end
+      if menu then Safely(FixCampaignHome, menu, positions, seen) end
+      if menu and state.directCampaign() then
+
+        menu:registerEventHandler("button_prompt_back", function() end)
+      end
+      return menu
+    end
+  end
+
+
+  state.directCampaign = function()
+    return UIExpression.DvarInt(nil, "bo2zm_cp_direct_ui") == 1
+  end
+  local function DirectFinish(menu, event)
+    local controller = event.controller or UIExpression.GetPrimaryController()
+    Engine.ExecNow(controller, "disableallbutprimaryclients")
+    Engine.SetDvar("ui_skipMainLockout", 1)
+    if CoD.ShadesHud then
+      CoD.ShadesHud.bootupComplete = true
+    end
+    CoD.Menu.targetLandingMenu = "CampaignMenu"
+    Engine.SendMenuResponse(controller, "lockout", "skipped")
+    Engine.SetDvar("ui_onLockOutMenu", 0)
+    local parent = menu:getParent()
+    local campaign = LUI.createMenu.CampaignMenu(controller)
+    if parent and campaign then
+      parent:addElement(campaign)
+    end
+    menu:close()
+    Log("campaign: started on the campaign page (controller " .. tostring(controller) .. ")")
+  end
+
+
+  state.loadingScreen = function(veil)
+    local fonts = CoD.fonts or {}
+    local font = fonts.Big or fonts.Condensed or fonts.Default
+    local height = 40
+    local phrase = "Campaign Scene Loading"
+    local measure = rawget(_G, "GetTextDimensions")
+    local function Width(text, guess)
+      if measure then
+        local ok, left, _, right = pcall(measure, text, font, height)
+        if ok and type(left) == "number" and type(right) == "number" and right > left then
+          return right - left
+        end
+      end
+      return guess
+    end
+    local phraseWidth = Width(phrase, height * 0.5 * #phrase)
+    local dotsWidth = Width("...", height * 0.6) + 4
+    local left = -math.floor((phraseWidth + dotsWidth) / 2)
+    local white = CoD.offWhite or {r = 0.9, g = 0.9, b = 0.9}
+    local orange = CoD.BOIIOrange or {r = 1, g = 0.5, b = 0.1}
+    local content = LUI.UIElement.new()
+    content:setLeftRight(true, true, 0, 0)
+    content:setTopBottom(true, true, 0, 0)
+    content:setAlpha(0)
+    local spinner = LUI.UIImage.new()
+    spinner:setLeftRight(false, false, -40, 40)
+    spinner:setTopBottom(false, false, -100, -20)
+    spinner:setImage(RegisterMaterial("lui_loader"))
+    content:addElement(spinner)
+    local text = LUI.UIText.new()
+    text:setLeftRight(false, false, left, left + phraseWidth)
+    text:setTopBottom(false, false, 8, 8 + height)
+    text:setFont(font)
+    text:setAlignment(LUI.Alignment.Left)
+    text:setRGB(white.r, white.g, white.b)
+    text:setText(phrase)
+    content:addElement(text)
+    local dots = LUI.UIText.new()
+    dots:setLeftRight(false, false, left + phraseWidth, left + phraseWidth + dotsWidth)
+    dots:setTopBottom(false, false, 8, 8 + height)
+    dots:setFont(font)
+    dots:setAlignment(LUI.Alignment.Left)
+    dots:setRGB(orange.r, orange.g, orange.b)
+    dots:setText("")
+    dots.count = 0
+    dots:registerEventHandler("bo2zm_loading_dots", function(self)
+      self.count = (self.count + 1) % 4
+      self:setText(string.rep(".", self.count))
+    end)
+    dots:addElement(LUI.UITimer.new(400, "bo2zm_loading_dots", false))
+    content:addElement(dots)
+    veil:addElement(content)
+    content:beginAnimation("bo2zm_fade_in", 300)
+    content:setAlpha(1)
+  end
+  state.wrapFrontEndRoot = function(original)
+    return function(controller, ...)
+      local root = original(controller, ...)
+      if root and state.directCampaign() then
+        Safely(function()
+
+          local veil = LUI.UIElement.new()
+          veil:setLeftRight(true, true, 0, 0)
+          veil:setTopBottom(true, true, 0, 0)
+          veil:setAlpha(1)
+          local black = LUI.UIImage.new()
+          black:setLeftRight(true, true, 0, 0)
+          black:setTopBottom(true, true, 0, 0)
+          black:setRGB(0, 0, 0)
+          veil:addElement(black)
+          veil:setPriority(10000)
+          veil.ticks = 0
+          Engine.ExecNow(controller or 0, "bo2zm_input_block 1")
+          veil:registerEventHandler("bo2zm_backdrop_check", Protect(function(self)
+            self.ticks = self.ticks + 1
+            if not self.fading and (UIExpression.DvarInt(nil, "bo2zm_cp_backdrop_ui") == 1 or self.ticks > 100) then
+              self.fading = true
+              Engine.ExecNow(controller or 0, "bo2zm_input_block 0")
+              self:beginAnimation("bo2zm_fade", 400)
+              self:setAlpha(0)
+              Log("front end: backdrop shown after " .. self.ticks * 100 .. " ms")
+            end
+          end))
+          veil:registerEventHandler("transition_complete_bo2zm_fade", function(self)
+            self:close()
+          end)
+          veil:addElement(LUI.UITimer.new(100, "bo2zm_backdrop_check", false))
+          root:addElement(veil)
+          Safely(function() state.loadingScreen(veil) end)
+        end)
+      end
+      return root
+    end
+  end
+  state.wrapLockOut = function(original)
+    return function(controller, ...)
+      local menu = original(controller, ...)
+      if menu and state.directCampaign() then
+        Safely(function()
+          menu:registerEventHandler("save_device_selected", Protect(DirectFinish))
+          menu:registerEventHandler("bo2zm_auto_start", Protect(function(self)
+            self:processEvent({name = "open_main_menu", controller = UIExpression.GetPrimaryController()})
+          end))
+          menu:addElement(LUI.UITimer.new(100, "bo2zm_auto_start", true))
+        end)
+      end
+      return menu
+    end
+  end
+
+  function WrapCampaignPauseAddButton(original)
+    return function(list, label, event, ...)
+      local button = original(list, label, event, ...)
+      if event == "open_options" then
+        Safely(function()
+          local extras = original(list, "EXTRAS", "bo2zm_open_extras")
+          extras.hintText = CampaignExtrasHint
+        end)
+      end
+      return button
+    end
+  end
+end
+
+
+state.localLobby = function(menu, controller)
+  Engine.ExecNow(controller, "bo2zm_local_lobby 1 " .. tostring(controller))
+  local close = menu.close
+  menu.close = function(self, ...)
+    Safely(function()
+      Engine.ExecNow(controller, "bo2zm_local_lobby 0")
+    end)
+    return close(self, ...)
+  end
+end
+
+
+state.systemLink = function()
+  if type(UIExpression.SessionMode_IsSystemlinkGame) == "function" then
+    local ok, value = pcall(UIExpression.SessionMode_IsSystemlinkGame)
+    return ok and value == 1
+  end
+  local CoD = rawget(_G, "CoD")
+  if CoD and CoD.SESSIONMODE_SYSTEMLINK and type(Engine.SessionModeIsMode) == "function" then
+    local ok, value = pcall(Engine.SessionModeIsMode, CoD.SESSIONMODE_SYSTEMLINK)
+    return ok and value == true
+  end
+  return false
+end
+state.systemLinkLobby = function(menu, controller)
+  if not state.systemLink() then
+    return state.localLobby(menu, controller)
+  end
+  ClearStartMatchHint(menu.buttonPane)
+  PatchBotsLobby(menu, controller, true)
+  Safely(state.onlineLobby, menu)
+end
+
+
+state.home = {moves = {}, positions = {}}
+state.homeClock = function()
+  local ok, value = pcall(UIExpression.milliseconds, nil)
+  if ok and type(value) == "number" then
+    return value
+  end
+  return nil
+end
+state.homeNode = function(kind, node, front, frontB)
+  local CoD = rawget(_G, "CoD")
+  if kind == "fog" then
+    return CoD.Fog.Path[node], CoD.Fog.TileWidth, nil
+  end
+  local G = CoD.GameRockZombie
+  local path = front and (frontB and G.RockFrontBPath or G.RockFrontPath) or G.RockBackPath
+  return path[node], G.RockTileWidth, G.RockTileHeight
+end
+state.homePlace = function(element, x, y, width, height)
+  element:setLeftRight(false, false, x - width * 0.5, x + width * 0.5)
+  if y and height then
+    element:setTopBottom(false, false, y - height * 0.5, y + height * 0.5)
+  end
+end
+state.wrapHomeMove = function(kind)
+  return function(original)
+    return function(element, reset, node, front, frontB, ...)
+      Safely(function()
+        local target, width, height = state.homeNode(kind, node, front, frontB)
+        if not target or not element then
+          return
+        end
+        local from = state.home.positions[element]
+        local now = state.homeClock()
+        state.home.positions[element] = {x = target.x, y = target.y}
+        if reset or not from or not now or type(target.forwardTime) ~= "number" then
+          state.home.moves[element] = nil
+          return
+        end
+        state.home.moves[element] = {start = now, duration = target.forwardTime, from = from, to = target,
+                                     width = width, height = height}
+      end)
+      return original(element, reset, node, front, frontB, ...)
+    end
+  end
+end
+
+state.wrapHomeReset = function(original)
+  return function(element, node, ...)
+    Safely(function()
+      if element and type(node) == "table" then
+        state.home.positions[element] = {x = node.x, y = node.y}
+        state.home.moves[element] = nil
+      end
+    end)
+    return original(element, node, ...)
+  end
+end
+state.homeHold = function(hold)
+  if UIExpression.IsInGame() == 1 then
+    return
+  end
+  local now = state.homeClock()
+  if hold and not state.home.held and now then
+    local held = 0
+    for element, move in pairs(state.home.moves) do
+      local done = math.min(math.max((now - move.start) / math.max(move.duration, 1), 0), 1)
+      if done < 1 then
+        move.left = move.duration * (1 - done)
+        move.handler = element.m_eventHandlers and element.m_eventHandlers.transition_complete_move_to_next
+        if move.handler then
+          element.m_eventHandlers.transition_complete_move_to_next = nil
+        end
+        local x = move.from.x + (move.to.x - move.from.x) * done
+        local y = move.from.y and move.to.y and move.from.y + (move.to.y - move.from.y) * done
+        element:beginAnimation("bo2zm_hold", 1)
+        state.homePlace(element, x, y, move.width, move.height)
+        move.held = {x = x, y = y}
+        held = held + 1
+      end
+    end
+    state.home.held = true
+    Log("home background: " .. held .. " moving tiles held behind the popup")
+  elseif not hold and state.home.held then
+    state.home.held = nil
+    local resumed = 0
+    for element, move in pairs(state.home.moves) do
+      if move.held then
+        if move.handler then
+          element.m_eventHandlers.transition_complete_move_to_next = move.handler
+          move.handler = nil
+        end
+        move.from = move.held
+        move.start = now or move.start
+        move.duration = move.left
+        element:beginAnimation("move_to_next", math.max(move.left, 1))
+        state.homePlace(element, move.to.x, move.to.y, move.width, move.height)
+        move.held = nil
+        resumed = resumed + 1
+      end
+    end
+    Log("home background: " .. resumed .. " tiles moving again")
+  end
+end
+state.wrapUpdateBlur = function(original)
+  return function(menu, ...)
+    local result = original(menu, ...)
+    Safely(state.homeHold, menu.occludedMenu ~= nil)
+    return result
+  end
+end
+
+local function WrapField(tbl, key, make)
+  if type(tbl) ~= "table" or type(tbl[key]) ~= "function" then
+    return
+  end
+  local mine = state.wrappers[tbl]
+  if mine and mine[key] == tbl[key] then
+    return
+  end
+  local wrapper = make(tbl[key])
+  tbl[key] = wrapper
+  if not mine then
+    mine = {}
+    state.wrappers[tbl] = mine
+  end
+  mine[key] = wrapper
+end
+
+
+state.wrapFirstSnapshot = function(original)
+  return function(hud, ...)
+    local result = original(hud, ...)
+    local CoD = rawget(_G, "CoD")
+    if hud and hud.safeArea and CoD and CoD.GameMessages and Engine.IsSplitscreen() then
+      Safely(function()
+        CoD.GameMessages.AddObituaryWindow(hud, {leftAnchor = true, rightAnchor = false, left = 13, right = 277,
+          topAnchor = false, bottomAnchor = true, top = -320, bottom = -220})
+        CoD.GameMessages.BoldGameMessagesWindow(hud, {leftAnchor = false, rightAnchor = false, left = 0, right = 0,
+          topAnchor = true, bottomAnchor = false, top = 50, bottom = 70})
+        Log("split-screen HUD: message windows added")
+      end)
+    end
+    return result
+  end
+end
+
+local function WrapMenu(patch)
+  return function(original)
+    return function(controller, ...)
+      local menu = original(controller, ...)
+      if menu then
+        Safely(patch, menu, controller)
+      end
+      return menu
+    end
+  end
+end
+
+
+(function()
+  if state.campaign() then return end
+  local camo = {
+
+
+    allowed = {[16] = false, [45] = true, [46] = true, [47] = true, [48] = true, [49] = true,
+      [50] = true, [51] = true, [52] = true, [53] = true, [54] = true, [66] = true, [67] = true,
+      [68] = true, [69] = true, [74] = true, [75] = true, [76] = true, [77] = true, [78] = true,
+      [79] = true, [91] = true, [92] = true, [93] = true, [94] = true, [96] = true},
+  }
+
+  function camo.enabled()
+    local cod = rawget(_G, "CoD")
+    return cod ~= nil and cod.isMultiplayer == true and cod.isSinglePlayer == false and cod.isZombie == false
+      and UIExpression.DvarInt(nil, "bo2mp_local_camos_ui") == 1
+      and type(Engine.SessionModeIsMode) == "function" and type(Engine.GameModeIsMode) == "function"
+      and cod.SESSIONMODE_OFFLINE == 0 and cod.GAMEMODE_LOCAL_SPLITSCREEN == 2
+      and Engine.SessionModeIsMode(cod.SESSIONMODE_OFFLINE)
+      and Engine.GameModeIsMode(cod.GAMEMODE_LOCAL_SPLITSCREEN)
+  end
+
+  function camo.wrapHidden(original)
+    return function(option, ...)
+      if camo.enabled() and camo.allowed[option] ~= nil then return false end
+      return original(option, ...)
+    end
+  end
+
+  function camo.wrapDisplay(original)
+    return function(controller, option, ...)
+      if camo.enabled() and camo.allowed[option] == true then return true end
+      return original(controller, option, ...)
+    end
+  end
+
+
+  function camo.restore(button, controller)
+    local saved = button.bo2mpLocalCamo
+    if not saved then return end
+    button.bo2mpLocalCamo = nil
+    button:setLocked(saved.locked, controller)
+    if saved.mtxPurchased ~= nil then
+      CoD.ContentGridButton.SetMTXPurchased(button, saved.mtxPurchased, controller)
+    end
+    button:setInactive(saved.inactive)
+    button:setHintText(saved.hintText, saved.hintImage)
+    button:setActionPromptString(saved.prompt)
+    button.overrideLock, button.customEvent = saved.overrideLock, saved.customEvent
+    button.showProgressBar = saved.progress
+  end
+
+  function camo.wrapUpdate(original)
+    return function(button, event, ...)
+      local controller = event.controller
+      camo.restore(button, controller)
+      local result = original(button, event, ...)
+      local mtx = camo.allowed[button.weaponOption]
+      if camo.enabled() and mtx ~= nil and not event.challengeMenu then
+        button.bo2mpLocalCamo = {locked = button.lockImage ~= nil, inactive = button.inactive,
+          hintText = button.hintText, hintImage = button.hintImage, prompt = button.actionPromptString,
+          overrideLock = button.overrideLock, customEvent = button.customEvent, progress = button.showProgressBar}
+        if mtx then
+          button.bo2mpLocalCamo.mtxPurchased = button.mtxImage == nil
+          CoD.ContentGridButton.SetMTXPurchased(button, true, controller)
+        end
+        button:setLocked(false, controller)
+        button:setInactive(false)
+        button:setHintText("")
+        button:setActionPromptString(Engine.Localize("MENU_SELECT"))
+        button.overrideLock, button.customEvent = nil, nil
+        button.showProgressBar = false
+      end
+      return result
+    end
+  end
+
+  function camo.wrapSelected(original)
+    return function(container, event, ...)
+      local button = event.button
+      if button and button.bo2mpLocalCamo and not camo.enabled() then
+        camo.restore(button, event.controller)
+        return
+      end
+      return original(container, event, ...)
+    end
+  end
+
+
+  function camo.rebind(element, depth, original, wrapper)
+    for name, handler in pairs(element.m_eventHandlers or {}) do
+      if handler == original then element:registerEventHandler(name, wrapper) end
+    end
+    if depth == 0 or type(element.getFirstChild) ~= "function" then return end
+    local child = element:getFirstChild()
+    while child do
+      camo.rebind(child, depth - 1, original, wrapper)
+      child = child:getNextSibling()
+    end
+  end
+
+  function camo.rebindRoots(original, wrapper)
+    if type(original) == "function" and original ~= wrapper then
+      for _, root in pairs(LUI.roots or {}) do camo.rebind(root, 12, original, wrapper) end
+    end
+  end
+
+  state.installLocalCamos = function()
+    local cod = rawget(_G, "CoD")
+    if not cod then return end
+    WrapField(cod.CACCamo, "IsCamoHidden", camo.wrapHidden)
+    WrapField(cod.CACUtility, "ShouldDisplayWeaponOptionMTX", camo.wrapDisplay)
+    if cod.CACCamo then
+      local original = cod.CACCamo.CamoButtonSelected
+      WrapField(cod.CACCamo, "CamoButtonSelected", camo.wrapSelected)
+      camo.rebindRoots(original, cod.CACCamo.CamoButtonSelected)
+    end
+    local grid = cod.CamoGridButton
+    if not grid then return end
+    local original = grid.UpdateClass
+    WrapField(grid, "UpdateClass", camo.wrapUpdate)
+    camo.rebindRoots(original, grid.UpdateClass)
+  end
+end)()
+
+local function Install()
+  local createMenu = LUI.createMenu
+  if state.installLocalCamos then state.installLocalCamos() end
+  if state.campaign() then
+    WrapField(createMenu, "GraphicsSettings", WrapMenu(PatchGraphicsSettings))
+    WrapField(createMenu, "OptionsMenu", WrapMenu(PatchOptions))
+    WrapField(createMenu, "CampaignMenu", WrapMenu(PatchCampaignMenu))
+    WrapField(createMenu, "MainMenu", state.wrapCampaignHome)
+    WrapField(createMenu, "LockOutMenu", state.wrapLockOut)
+    WrapField(createMenu, "main", state.wrapFrontEndRoot)
+    WrapField(createMenu, "ObjectiveInfoMenu", WrapMenu(PatchCampaignPause))
+    for _, entry in ipairs(state.pageBuilders) do
+      if createMenu[entry[1]] ~= entry[2] then
+        createMenu[entry[1]] = entry[2]
+      end
+    end
+    local CoD = rawget(_G, "CoD")
+    if CoD then
+      WrapField(CoD.ObjectiveInfoMenu, "AddButton", WrapCampaignPauseAddButton)
+    end
+    return
+  end
+  WrapField(createMenu, "MainMenu", WrapMenu(PatchMainMenuForTests))
+  WrapField(createMenu, "GraphicsSettings", WrapMenu(PatchGraphicsSettings))
+  WrapField(createMenu, "OptionsMenu", WrapMenu(PatchOptions))
+  if state.zombies() then
+    WrapField(createMenu, "HUD", WrapMenu(PatchHud))
+    WrapField(_G, "HUD_FirstSnapshot_Zombie", state.wrapFirstSnapshot)
+    WrapField(createMenu, "SelectMapZM", WrapMenu(TestPickMap))
+    WrapField(createMenu, "Loading", WrapLoading)
+  end
+  WrapField(createMenu, "SplitscreenGameLobby", WrapMenu(function(menu, controller)
+    Safely(state.localLobby, menu, controller)
+    TestStartMatch(menu, controller)
+  end))
+  WrapField(createMenu, "PrivateLocalGameLobby", function(original)
+    return state.onlineTitled(WrapMenu(state.systemLinkLobby)(original))
+  end)
+  WrapField(createMenu, "ServerBrowser", function(original)
+    return state.onlineTitled(WrapMenu(state.onlineBrowser)(original))
+  end)
+  for _, entry in ipairs(state.pageBuilders) do
+    if createMenu[entry[1]] ~= entry[2] then
+      createMenu[entry[1]] = entry[2]
+    end
+  end
+
+
+  if state.zombies() then
+    state.hudWasHidden = state.hudWasHidden or {}
+    for controller = 0, 3 do
+      local hidden = HudHiddenPicked(controller)
+      if hidden or state.hudWasHidden[controller] then ApplyHud(controller, hidden) end
+      state.hudWasHidden[controller] = hidden
+    end
+  end
+  local CoD = rawget(_G, "CoD")
+  if CoD then
+    if state.zombies() then
+      WrapField(CoD.Menu, "NewFromState", WrapNewFromState)
+      WrapField(CoD.Menu, "updateBlur", state.wrapUpdateBlur)
+      WrapField(CoD.GameRockZombie, "RegisterMoveToNextState", state.wrapHomeMove("rock"))
+      WrapField(CoD.Fog, "RegisterMoveToNextState", state.wrapHomeMove("fog"))
+      WrapField(CoD.GameRockZombie, "Reset", state.wrapHomeReset)
+      WrapField(CoD.Fog, "Reset", state.wrapHomeReset)
+    end
+    WrapField(CoD.Class, "AddButton", WrapPauseAddButton)
+    state.installHostPause(WrapField, createMenu, CoD)
+    WrapField(CoD.PrivateGameLobby, "PopulateButtons", WrapLobbyPopulate)
+    WrapField(CoD.PrivateLocalGameLobby, "PopulateButtons", WrapLobbyPopulate)
+
+
+    WrapField(CoD.PlaylistButton, "new", WrapSteadyButtonNew)
+  end
+end
+
+
+state.install = function()
+  Safely(Install)
+end
+
+Safely(Install)
+local originalRequire = rawget(_G, "require")
+rawset(_G, "require", function(...)
+  local a, b, c = originalRequire(...)
+  Safely(Install)
+  return a, b, c
+end)
+local pages = 0
+for _, entry in ipairs(state.pageBuilders) do
+  if LUI.createMenu[entry[1]] == entry[2] then
+    pages = pages + 1
+  end
+end
+Log("menus.lua installed, " .. pages .. " of " .. #state.pageBuilders .. " menus (the Extras pages, CHECK FOR UPDATES)")
+return true

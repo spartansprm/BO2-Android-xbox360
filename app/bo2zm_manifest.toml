@@ -1,0 +1,11 @@
+[project]
+name = "bo2zm"
+sdk_version = "0.10.0"
+game_root = "../work/load_tu18"
+
+[entrypoint]
+file_path = "../work/load_tu18/default_mp.xex"
+out_directory_path = "generated/default_mp"
+
+
+includes = ["overrides.toml", "gaps.toml"]

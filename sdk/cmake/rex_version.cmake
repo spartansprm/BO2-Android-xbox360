@@ -1,0 +1,140 @@
+function(rex_compute_version out_var)
+    set(one_value FLOOR_MAJOR FLOOR_MINOR GIT_DESCRIBE_LONG GIT_DESCRIBE_EXACT BRANCH_NAME)
+    cmake_parse_arguments(ARG "" "${one_value}" "" ${ARGN})
+
+    if(NOT "${ARG_GIT_DESCRIBE_EXACT}" STREQUAL "")
+        if(ARG_GIT_DESCRIBE_EXACT MATCHES "^v([0-9]+\\.[0-9]+(\\.[0-9]+)?(\\.[0-9]+)?)$")
+            set(${out_var} "${CMAKE_MATCH_1}" PARENT_SCOPE)
+            return()
+        endif()
+        message(FATAL_ERROR "rex_compute_version: unparseable exact tag '${ARG_GIT_DESCRIBE_EXACT}'")
+    endif()
+
+    if("${ARG_GIT_DESCRIBE_LONG}" STREQUAL "")
+        message(WARNING
+            "rex_compute_version: no v* tag reachable from HEAD. "
+            "Falling back to ${ARG_FLOOR_MAJOR}.${ARG_FLOOR_MINOR}.0.0-dev.unknown. "
+            "If this is a CI build, ensure tags are fetched (fetch-depth: 0 + fetch-tags: true). "
+            "If this is a fork, push tags with: git push <fork-remote> --tags")
+        set(${out_var} "${ARG_FLOOR_MAJOR}.${ARG_FLOOR_MINOR}.0.0-dev.unknown" PARENT_SCOPE)
+        return()
+    endif()
+
+    if(NOT ARG_GIT_DESCRIBE_LONG MATCHES "^v([0-9]+)\\.([0-9]+)(\\.([0-9]+))?(\\.([0-9]+))?-([0-9]+)-g([0-9a-f]+)$")
+        message(FATAL_ERROR "rex_compute_version: unparseable describe output '${ARG_GIT_DESCRIBE_LONG}'")
+    endif()
+    set(tag_major ${CMAKE_MATCH_1})
+    set(tag_minor ${CMAKE_MATCH_2})
+    if(CMAKE_MATCH_4)
+        set(tag_patch ${CMAKE_MATCH_4})
+    else()
+        set(tag_patch 0)
+    endif()
+    set(commit_count ${CMAKE_MATCH_7})
+    set(short_sha ${CMAKE_MATCH_8})
+
+    if(ARG_BRANCH_NAME MATCHES "^release/")
+        set(id "rc.g${short_sha}")
+    else()
+        set(id "dev.g${short_sha}")
+    endif()
+
+
+    if(ARG_FLOOR_MAJOR LESS tag_major OR
+       (ARG_FLOOR_MAJOR EQUAL tag_major AND ARG_FLOOR_MINOR LESS tag_minor))
+        message(FATAL_ERROR
+            "rex_compute_version: floor version (${ARG_FLOOR_MAJOR}.${ARG_FLOOR_MINOR}) is behind "
+            "tag version (${tag_major}.${tag_minor}). The floor in CMakeLists.txt must not regress.")
+    endif()
+
+    if(ARG_FLOOR_MAJOR EQUAL tag_major AND ARG_FLOOR_MINOR EQUAL tag_minor)
+
+
+        set(${out_var} "${ARG_FLOOR_MAJOR}.${ARG_FLOOR_MINOR}.${tag_patch}.${commit_count}-${id}" PARENT_SCOPE)
+    else()
+
+
+        set(${out_var} "${ARG_FLOOR_MAJOR}.${ARG_FLOOR_MINOR}.0-${id}" PARENT_SCOPE)
+    endif()
+endfunction()
+
+
+function(rex_version_channel out_var)
+    set(one_value VERSION)
+    cmake_parse_arguments(ARG "" "${one_value}" "" ${ARGN})
+
+    if(ARG_VERSION MATCHES "-rc\\.")
+        set(${out_var} "rc" PARENT_SCOPE)
+    elseif(ARG_VERSION MATCHES "-dev\\.")
+        set(${out_var} "dev" PARENT_SCOPE)
+    else()
+        set(${out_var} "release" PARENT_SCOPE)
+    endif()
+endfunction()
+
+
+function(rex_resolve_version out_var)
+    set(one_value FLOOR_MAJOR FLOOR_MINOR SOURCE_DIR)
+    cmake_parse_arguments(ARG "" "${one_value}" "" ${ARGN})
+
+    if(NOT ARG_SOURCE_DIR)
+        set(ARG_SOURCE_DIR "${CMAKE_SOURCE_DIR}")
+    endif()
+
+    find_program(GIT_EXECUTABLE git)
+    if(NOT GIT_EXECUTABLE)
+        rex_compute_version(result
+            FLOOR_MAJOR ${ARG_FLOOR_MAJOR}
+            FLOOR_MINOR ${ARG_FLOOR_MINOR}
+            GIT_DESCRIBE_LONG ""
+            GIT_DESCRIBE_EXACT ""
+            BRANCH_NAME "")
+        set(${out_var} "${result}" PARENT_SCOPE)
+        return()
+    endif()
+
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} describe --tags --exact-match
+            --match "v[0-9]*.[0-9]*.[0-9]*"
+            --exclude "*-*"
+        WORKING_DIRECTORY "${ARG_SOURCE_DIR}"
+        OUTPUT_VARIABLE describe_exact
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE describe_exact_rc)
+    if(NOT describe_exact_rc EQUAL 0)
+        set(describe_exact "")
+    endif()
+
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} describe --tags --long
+            --match "v[0-9]*.[0-9]*"
+            --exclude "*-*"
+        WORKING_DIRECTORY "${ARG_SOURCE_DIR}"
+        OUTPUT_VARIABLE describe_long
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE describe_long_rc)
+    if(NOT describe_long_rc EQUAL 0)
+        set(describe_long "")
+    endif()
+
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} symbolic-ref --short HEAD
+        WORKING_DIRECTORY "${ARG_SOURCE_DIR}"
+        OUTPUT_VARIABLE branch_name
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE branch_rc)
+    if(NOT branch_rc EQUAL 0)
+        set(branch_name "")
+    endif()
+
+    rex_compute_version(result
+        FLOOR_MAJOR ${ARG_FLOOR_MAJOR}
+        FLOOR_MINOR ${ARG_FLOOR_MINOR}
+        GIT_DESCRIBE_LONG "${describe_long}"
+        GIT_DESCRIBE_EXACT "${describe_exact}"
+        BRANCH_NAME "${branch_name}")
+    set(${out_var} "${result}" PARENT_SCOPE)
+endfunction()

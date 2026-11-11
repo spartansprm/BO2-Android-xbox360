@@ -1,0 +1,86 @@
+{
+  "sdk_source": {
+    "repo": "rexglue/rexglue-sdk",
+    "commit": "c94f5ebdcb3c9d1a460ca48e04f9758448f8d518",
+    "archive_sha256": "f346972da937fbf1561235032cfa06ef16a1f0e994aa3aaf6028fbc51e785a3f"
+  },
+  "dependencies": [
+    {
+      "name": "cli11",
+      "repo": "CLIUtils/CLI11",
+      "commit": "bfffd37e1f804ca4fae1caae106935791696b6a9",
+      "archive_sha256": "03c9b7921b8f99ca39ae660b03ebf9bd5a3f4280201f7d04bc5639b1e0496401",
+      "archive_bytes": 392159
+    },
+    {
+      "name": "libmspack",
+      "repo": "kyz/libmspack",
+      "commit": "305907723a4e7ab2018e58040059ffb5e77db837",
+      "archive_sha256": "342427b589ec04ba50ac5662119400955cbb0d9c52259ad1c8188dae505ab0f2",
+      "archive_bytes": 409099
+    },
+    {
+      "name": "FFmpeg",
+      "repo": "wmarti/FFmpeg",
+      "commit": "0604b464c7cb4ebc94940cf1f324a3b26b87717c",
+      "archive_sha256": "cb05b8b2a0ea051150bd70bc98091cd1e27f92f5000b48bbfe3828b0e89d4991",
+      "archive_bytes": 13842847
+    },
+    {
+      "name": "tomlplusplus",
+      "repo": "marzer/tomlplusplus",
+      "commit": "30172438cee64926dc41fdd9c11fb3ba5b2ba9de",
+      "archive_sha256": "291254ffe7f2433f90deef878d0d9335534a350a958ea23ecf511b7b2277bf7f",
+      "archive_bytes": 1295179
+    },
+    {
+      "name": "simde",
+      "repo": "simd-everywhere/simde",
+      "commit": "71fd833d9666141edcd1d3c109a80e228303d8d7",
+      "archive_sha256": "72b2c14a487560b7eb203795f2c2fead5c7499662e639944cca2a9bb19f09029",
+      "archive_bytes": 7481259
+    },
+    {
+      "name": "xxHash",
+      "repo": "Cyan4973/xxHash",
+      "commit": "e626a72bc2321cd320e953a0ccf1584cad60f363",
+      "archive_sha256": "34e71c085636fbc1726482996d92719d0a16e6a6097970ecf2990a27b3821162",
+      "archive_bytes": 1147772
+    },
+    {
+      "name": "spdlog",
+      "repo": "gabime/spdlog",
+      "commit": "79524ddd08a4ec981b7fea76afd08ee05f83755d",
+      "archive_sha256": "c6dee844e35a54cc80e3ab76aae2310763e0b49c7397549dfa4d4657d9737138",
+      "archive_bytes": 281845
+    },
+    {
+      "name": "fmt",
+      "repo": "fmtlib/fmt",
+      "commit": "407c905e45ad75fc29bf0f9bb7c5c2fd3475976f",
+      "archive_sha256": "2bc1fe4a5b6d5d6a614239b4ca1d520e66e152a02d3d262684d26dfd6ab3438a",
+      "archive_bytes": 711737
+    },
+    {
+      "name": "utfcpp",
+      "repo": "nemtrif/utfcpp",
+      "commit": "63d64de49fd6b829f7c8694df5ab2ee625cb7134",
+      "archive_sha256": "f11186e50579ba4404ad531be74f30b31fa8986abe54f4742cfef52009a4f614",
+      "archive_bytes": 35376
+    },
+    {
+      "name": "imgui",
+      "repo": "ocornut/imgui",
+      "commit": "6d910d5487d11ca567b61c7824b0c78c569d62f0",
+      "archive_sha256": "b715a3226320aaebaea79dc6af6405ae37cdcb479817fddaef12a17d8bd15a3a",
+      "archive_bytes": 2012931
+    },
+    {
+      "name": "o1heap",
+      "repo": "pavel-kirienko/o1heap",
+      "commit": "388a73fd9007300e5130c5fe352d9ce3288b6dde",
+      "archive_sha256": "b9c6c40d1eda938028c8a9e3d1de3a4e0762bd6253bcaef37169e8962e8a5ec9",
+      "archive_bytes": 401202
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+setjmp_address = 0x82918CA0
+longjmp_address = 0x82919E50
+
+
+skip_msr = true
+
+
+cr_as_local = true
+xer_as_local = true
+ctr_as_local = true
+non_volatile_as_local = true
+
+
+vector_scratch_as_local = true
+
+[functions]
+
+
+"0x8279F8F0" = { }   # lis/ori r11,0x17164; lwzx r3,r3,r11; blr   (getter)   <- 0x827981B0
+"0x8279F908" = { }   # addi r3,r3,0x110; b 0x827C0590   (this-adjust thunk) <- 0x82798244
+"0x8279F910" = { }   # addi r3,r3,0x110; b 0x827C0598   (this-adjust thunk) <- 0x82798258
+"0x8279F918" = { }   # addi r3,r3,0x110; b 0x827C05A0   (this-adjust thunk) <- 0x82798268
+"0x8279F920" = { }   # addi r3,r3,0x110; b 0x827C05A8   (this-adjust thunk) <- 0x827982A0
+"0x8279F928" = { }   # addis/addi r3,r3,0x17190; blr    (getter)            <- 0x82798278
+
+
+"0x8249AD08" = { }   # stw r4,0x20(r3); blr                                  <- 0x82534110
+
+
+"0x827C0590" = { }   # lwz r3, 0(r3); b 0x827c2250   <- 0x8279F90C
+"0x827C0598" = { }   # lwz r3, 0(r3); b 0x827c2260   <- 0x8279F914
+"0x827C05A0" = { }   # lwz r3, 0(r3); b 0x827c2258   <- 0x8279F91C
+"0x827C05A8" = { }   # slwi r11, r4, 3; add r11, r11, r3; stfs f1, 8(r11); stw r5, 4(r11); blr   <- 0x8279F924
+
+
+"0x82274C38" = { end = 0x82274C98 }
+"0x82274C98" = { }
+
+
+"0x828212C0" = { share_registers = true }
+"0x82821A80" = { share_registers = true }
+
+
+[rexcrt]
+
+
+bo2zm_memcpy = 0x82916330
+
+
+bo2zm_memmove = 0x82916270
+
+
+bo2zm_memset = 0x82916AE0
+
+
+bo2zm_xmemcpy = 0x827D33F0
+
+
+bo2zm_xmemset = 0x827D2EC0
+
+
+bo2zm_bigcopy = 0x827D3290
+bo2zm_bigcopy2 = 0x827D3340

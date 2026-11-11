@@ -1,0 +1,11 @@
+[project]
+name = "bo2cp"
+sdk_version = "0.10.0"
+game_root = "../work/load_tu18"
+
+[entrypoint]
+file_path = "../work/load_tu18/default.xex"
+out_directory_path = "generated/default"
+
+
+includes = ["overrides.toml", "gaps.toml"]

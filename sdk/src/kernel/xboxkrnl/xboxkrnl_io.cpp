@@ -1,0 +1,1296 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ *
+ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ */
+
+// Disable warnings about unused parameters for kernel functions
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+
+#include <atomic>
+#include <chrono>
+
+#include <rex/cvar.h>
+#include <rex/filesystem/device.h>
+#include <rex/filesystem/devices/host_path_device.h>
+#include <rex/filesystem/devices/host_path_file.h>
+#include <rex/filesystem/devices/stfs_container_file.h>
+#include <rex/kernel/xboxkrnl/private.h>
+#include <rex/logging.h>
+#include <rex/memory.h>
+#include <rex/hook.h>
+#include <rex/types.h>
+#include <rex/system/info/file.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/util/string_utils.h>
+#include <rex/system/xevent.h>
+#include <rex/system/xfile.h>
+#include <rex/system/xiocompletion.h>
+#include <rex/system/xsymboliclink.h>
+#include <rex/system/xthread.h>
+#include <rex/system/xtypes.h>
+#include <rex/thread/mutex.h>
+
+#include <cctype>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
+
+/*
+ * I/O measurement.
+ *
+ * The log only showed failures (they are WARN); everything else (how many opens there are, how long
+ * each one takes, how much is read) went to TRACE and did not show. And that is where the time was:
+ * failing opens cost 32 ms each. So every open and every read is timed, the ones over the limit are
+ * reported, and a summary is written every few seconds.
+ *
+ * A monotonic clock read per call is a few nanoseconds next to a trip to the SD. It is on.
+ */
+REXCVAR_DEFINE_INT32(switch_io_warning_ms, 8, "Filesystem",
+                     "Log every open or read that takes longer than this many ms (0 = never).");
+REXCVAR_DEFINE_INT32(switch_io_summary_s, 15, "Filesystem",
+                     "How often, in seconds, the [io] summary is written (0 = never).");
+
+namespace rex::kernel::xboxkrnl {
+using namespace rex::system;
+
+namespace {
+
+struct CountersIo {
+  std::atomic<uint64_t> opens_ok{0};
+  std::atomic<uint64_t> open_misses{0};
+  std::atomic<uint64_t> us_opens{0};
+  std::atomic<uint64_t> us_open_worst{0};
+  std::atomic<uint64_t> reads{0};
+  std::atomic<uint64_t> bytes_read{0};
+  std::atomic<uint64_t> us_reads{0};
+  std::atomic<uint64_t> us_read_worst{0};
+};
+
+CountersIo g_io;
+std::atomic<uint32_t> g_io_warnings{0};
+std::atomic<uint64_t> g_io_next_summary{0};
+
+/*
+ * Which part of what is read had already been read, and whether it is read sequentially.
+ *
+ * Logging only how many bytes and from which file, not from where, the most that could be checked
+ * was whether the (file, size) pair repeated. But "same size" is not "same place": the same size also
+ * comes from a sequential sweep (consecutive 4 MB reads at startup, for example). Without the offset the two cannot
+ * be told apart, and whether a block cache would remove reads depends on it.
+ *
+ * So the exact range is recorded. Two fixed-size tables, with no allocation or growth:
+ *  - ranges already seen (8,192 slots of 8 bytes = 64 KB), to count rereads of the same place;
+ *  - end of the last read of each file (64 slots), to count the reads that start exactly where the
+ *    previous one ended, which is what tells whether the read-ahead window has anything to do.
+ *
+ * It costs a hash of the name and a lock per read. That is 1,290 reads in 435 s: nothing.
+ */
+struct RangeState {
+  static constexpr size_t kSlots = 8192;  // power of two
+  static constexpr size_t kFiles = 64;
+  static constexpr size_t kPolls = 8;
+
+  std::mutex mutex;
+  uint64_t key[kSlots] = {};
+  uint64_t file_id[kFiles] = {};
+  uint64_t end[kFiles] = {};
+  // Totals for the whole session; the summary reports the difference from the previous snapshot.
+  uint64_t reread_count = 0, reread_bytes = 0;
+  uint64_t different = 0, bytes_different = 0;
+  uint64_t consecutive = 0, slot_evictions = 0;
+};
+RangeState g_ranges;
+
+inline uint64_t HashPath(const std::string_view s) {
+  uint64_t h = 1469598103934665603ull;
+  for (unsigned char c : s) {
+    h ^= c;
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+// Records the range read. Returns true if that exact range had already been read before.
+bool AnnotateRange(const std::string_view path_str, uint64_t offset_bytes, uint32_t bytes) {
+  if (!bytes) {
+    return false;
+  }
+  const uint64_t hr = HashPath(path_str);
+  uint64_t key = hr ^ (offset_bytes * 0x9E3779B97F4A7C15ull) ^ (uint64_t(bytes) << 1);
+  if (key == 0) {
+    key = 1;  // 0 marks a free slot
+  }
+
+  std::lock_guard<std::mutex> lock(g_ranges.mutex);
+
+  // Sequential read: it starts exactly where the previous read of this same file ended.
+  const size_t fi = static_cast<size_t>(hr % RangeState::kFiles);
+  if (g_ranges.file_id[fi] == hr && g_ranges.end[fi] == offset_bytes) {
+    ++g_ranges.consecutive;
+  }
+  g_ranges.file_id[fi] = hr;
+  g_ranges.end[fi] = offset_bytes + bytes;
+
+  // Repeated range. Open addressing with a few probes: if it does not fit, a slot is overwritten
+  // and that is counted.
+  const size_t base = static_cast<size_t>((key >> 17) & (RangeState::kSlots - 1));
+  for (size_t p = 0; p < RangeState::kPolls; ++p) {
+    const size_t j = (base + p) & (RangeState::kSlots - 1);
+    if (g_ranges.key[j] == key) {
+      ++g_ranges.reread_count;
+      g_ranges.reread_bytes += bytes;
+      return true;
+    }
+    if (g_ranges.key[j] == 0) {
+      g_ranges.key[j] = key;
+      ++g_ranges.different;
+      g_ranges.bytes_different += bytes;
+      return false;
+    }
+  }
+  g_ranges.key[base] = key;
+  ++g_ranges.different;
+  g_ranges.bytes_different += bytes;
+  ++g_ranges.slot_evictions;  // if this grows, the table is too small and the figures fall short too
+  return false;
+}
+
+// Snapshot of the previous summary, to report the interval and not the whole-session total.
+struct IoSnapshot {
+  uint64_t opens_ok = 0, open_misses = 0, us_opens = 0;
+  uint64_t reads = 0, bytes_read = 0, us_reads = 0;
+  uint64_t dry_misses = 0, sd_stats = 0, sd_sweeps = 0;
+  uint64_t hits = 0, fills = 0, direct = 0, bytes_ram = 0;
+  uint64_t reread_count = 0, reread_bytes = 0, different = 0, bytes_different = 0, consecutive = 0;
+};
+IoSnapshot g_io_snapshot;
+std::mutex g_io_snapshot_mutex;
+
+inline uint64_t NowUs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+}
+
+inline void MaxAtomic(std::atomic<uint64_t>& dest_entry, uint64_t val_word) {
+  uint64_t seen = dest_entry.load(std::memory_order_relaxed);
+  while (val_word > seen &&
+         !dest_entry.compare_exchange_weak(seen, val_word, std::memory_order_relaxed)) {
+  }
+}
+
+// A single thread writes the summary: whichever wins the exchange of the next deadline.
+void MaybeSummaryIo(uint64_t now_us) {
+  const int32_t period_s = REXCVAR_GET(switch_io_summary_s);
+  if (period_s <= 0) {
+    return;
+  }
+  uint64_t next_at = g_io_next_summary.load(std::memory_order_relaxed);
+  const uint64_t step = static_cast<uint64_t>(period_s) * 1000000ull;
+  if (next_at == 0) {
+    // First call: only the timer is armed, nothing is written yet.
+    g_io_next_summary.compare_exchange_strong(next_at, now_us + step,
+                                                 std::memory_order_relaxed);
+    return;
+  }
+  if (now_us < next_at) {
+    return;
+  }
+  if (!g_io_next_summary.compare_exchange_strong(next_at, now_us + step,
+                                                    std::memory_order_relaxed)) {
+    return;
+  }
+
+  const auto paths = rex::filesystem::ReadPathStats();
+  const auto window = rex::filesystem::ReadWindowStats();
+
+  IoSnapshot now;
+  now.opens_ok = g_io.opens_ok.load(std::memory_order_relaxed);
+  now.open_misses = g_io.open_misses.load(std::memory_order_relaxed);
+  now.us_opens = g_io.us_opens.load(std::memory_order_relaxed);
+  now.reads = g_io.reads.load(std::memory_order_relaxed);
+  now.bytes_read = g_io.bytes_read.load(std::memory_order_relaxed);
+  now.us_reads = g_io.us_reads.load(std::memory_order_relaxed);
+  now.dry_misses = paths.dry_misses;
+  now.sd_stats = paths.sd_stats;
+  now.sd_sweeps = paths.sd_sweeps;
+  now.hits = window.hits;
+  now.fills = window.fills;
+  now.direct = window.direct;
+  now.bytes_ram = window.bytes_ram;
+  uint64_t slot_evictions = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_ranges.mutex);
+    now.reread_count = g_ranges.reread_count;
+    now.reread_bytes = g_ranges.reread_bytes;
+    now.different = g_ranges.different;
+    now.bytes_different = g_ranges.bytes_different;
+    now.consecutive = g_ranges.consecutive;
+    slot_evictions = g_ranges.slot_evictions;
+  }
+
+  IoSnapshot d;
+  {
+    std::lock_guard<std::mutex> lock(g_io_snapshot_mutex);
+    d.opens_ok = now.opens_ok - g_io_snapshot.opens_ok;
+    d.open_misses = now.open_misses - g_io_snapshot.open_misses;
+    d.us_opens = now.us_opens - g_io_snapshot.us_opens;
+    d.reads = now.reads - g_io_snapshot.reads;
+    d.bytes_read = now.bytes_read - g_io_snapshot.bytes_read;
+    d.us_reads = now.us_reads - g_io_snapshot.us_reads;
+    d.dry_misses = now.dry_misses - g_io_snapshot.dry_misses;
+    d.sd_stats = now.sd_stats - g_io_snapshot.sd_stats;
+    d.sd_sweeps = now.sd_sweeps - g_io_snapshot.sd_sweeps;
+    d.hits = now.hits - g_io_snapshot.hits;
+    d.fills = now.fills - g_io_snapshot.fills;
+    d.direct = now.direct - g_io_snapshot.direct;
+    d.bytes_ram = now.bytes_ram - g_io_snapshot.bytes_ram;
+    d.reread_count = now.reread_count - g_io_snapshot.reread_count;
+    d.reread_bytes = now.reread_bytes - g_io_snapshot.reread_bytes;
+    d.different = now.different - g_io_snapshot.different;
+    d.bytes_different = now.bytes_different - g_io_snapshot.bytes_different;
+    d.consecutive = now.consecutive - g_io_snapshot.consecutive;
+    g_io_snapshot = now;
+  }
+
+  const uint64_t worst_open = g_io.us_open_worst.exchange(0, std::memory_order_relaxed);
+  const uint64_t worst_read = g_io.us_read_worst.exchange(0, std::memory_order_relaxed);
+  const uint64_t opens = d.opens_ok + d.open_misses;
+
+  REXKRNL_INFO(
+      "[io] {} s: {} opens ({} failed) {:.1f} ms in total, worst {:.1f} ms, average {:.2f} ms; "
+      "{} reads {:.1f} MB in {:.1f} ms, worst {:.1f} ms",
+      period_s, opens, d.open_misses, d.us_opens / 1000.0, worst_open / 1000.0,
+      opens ? (d.us_opens / 1000.0) / double(opens) : 0.0, d.reads,
+      d.bytes_read / (1024.0 * 1024.0), d.us_reads / 1000.0, worst_read / 1000.0);
+  REXKRNL_INFO(
+      "[io] paths: {} resolved without touching the SD, {} stats, {} directory scans ({} entries "
+      "in the tree); window: {} hits / {} fills / {} direct, {:.1f} MB from RAM, {} "
+      "files with a window",
+      d.dry_misses, d.sd_stats, d.sd_sweeps, paths.tree_entries, d.hits,
+      d.fills, d.direct, d.bytes_ram / (1024.0 * 1024.0), window.windows_live);
+
+  /*
+   * The line that tells whether a block cache is worth it and whether the window has anything to do.
+   *  - "reread"     = reads whose exact range (file+offset+size) had already been read before.
+   *                  A cache would remove those bytes entirely; not the rest.
+   *  - "sequential" = reads that start exactly where the previous one of the same file ended. If
+   *                  this is high, read-ahead helps; if it is low, the game jumps around and the
+   *                  window only gets in the way.
+   *  - "table evictions" = times the range table ran out of room. If it grows, the figures fall short.
+   */
+  const uint64_t reads_span = d.reread_count + d.different;
+  REXKRNL_INFO(
+      "[io] ranges: {} reread of {} ({:.0f} %), {:.1f} MB already read before, of {:.1f} MB ({:.0f} %); {} "
+      "sequential ({:.0f} %); {} table evictions",
+      d.reread_count, reads_span,
+      reads_span ? 100.0 * double(d.reread_count) / double(reads_span) : 0.0,
+      d.reread_bytes / (1024.0 * 1024.0),
+      (d.reread_bytes + d.bytes_different) / (1024.0 * 1024.0),
+      (d.reread_bytes + d.bytes_different)
+          ? 100.0 * double(d.reread_bytes) / double(d.reread_bytes + d.bytes_different)
+          : 0.0,
+      d.consecutive, reads_span ? 100.0 * double(d.consecutive) / double(reads_span) : 0.0,
+      slot_evictions);
+
+  /*
+   * The cache of large reads by exact range (switch_io_ranges_mb).
+   *
+   * It is accumulated since startup, not per interval: there are few events and what matters is
+   * the session total. And it is always printed, whether it is on or not and whether there was
+   * activity or not: there was already a counter that existed and was never printed, and without
+   * the line there is no way to tell whether it works.
+   *
+   * How to read it:
+   *  - "evictions" at 0 is what is expected. If it grows, the cap is too small and the LRU
+   *    drops entries before reusing them, which is exactly how the block cache died.
+   *  - "from the SD" against "from RAM" is the amplification. By exact range it must be 1:1 on
+   *    the first pass and go down from there; if more SD were read than delivered, something is
+   *    wrong (the block cache read 318 for 304 delivered, and that is why it was turned off).
+   */
+  const auto ranges = rex::filesystem::ReadRangeStats();
+  const uint64_t ranges_total = ranges.hits + ranges.misses;
+  REXKRNL_INFO(
+      "[io] range-cache: {} hits / {} misses ({:.0f} %), {:.1f} MB from RAM against {:.1f} MB "
+      "from the SD; {} live entries ({:.1f} MB of {} cap), {} evictions; not cached: {} below the "
+      "floor of {} KB, {} above the ceiling, {} from the load sweep ({:.1f} MB){}",
+      ranges.hits, ranges.misses,
+      ranges_total ? 100.0 * double(ranges.hits) / double(ranges_total) : 0.0,
+      ranges.bytes_ram / (1024.0 * 1024.0), ranges.bytes_disk / (1024.0 * 1024.0), ranges.entries,
+      ranges.live_bytes / (1024.0 * 1024.0), ranges.cap_mb, ranges.evictions, ranges.low_floor,
+      ranges.floor_kb, ranges.over_ceiling, ranges.sequential,
+      ranges.sequential_bytes / (1024.0 * 1024.0), ranges.no_memory ? " [OFF: out of memory]" : "");
+  // The same for container reads (StfsContainerFile): on Android this is the path base.ipak goes through.
+  {
+    const auto stfs = rex::filesystem::StfsReadCacheStats();
+    const uint64_t stfs_total = stfs.hits + stfs.misses;
+    REXKRNL_INFO(
+        "[io] container read-cache: {} hits / {} misses ({:.0f} %), {:.1f} MB from RAM against {:.1f} MB "
+        "from storage; {} live entries ({:.1f} MB of {} cap), {} evictions; not cached: {} below the "
+        "floor of {} KB, {} above the ceiling, {} from the load sweep ({} MB){}",
+        stfs.hits, stfs.misses, stfs_total ? 100.0 * double(stfs.hits) / double(stfs_total) : 0.0,
+        stfs.bytes_ram / (1024.0 * 1024.0), stfs.bytes_disk / (1024.0 * 1024.0), stfs.entries,
+        stfs.live_bytes / (1024.0 * 1024.0), stfs.cap_mb, stfs.evictions, stfs.low_floor,
+        stfs.floor_kb, stfs.over_ceiling, stfs.sequential, stfs.sequential_bytes,
+        stfs.no_memory ? " [OFF: out of memory]" : "");
+  }
+  const std::string files = rex::filesystem::TakeFilesReport(8);
+  if (!files.empty()) {
+    REXKRNL_INFO("[io] files read most: {}", files);
+  }
+}
+
+// Always measured: reading the monotonic clock on Horizon is a processor register read, not a system call.
+inline void AnnotateOpen(uint64_t us, bool ok, const std::string_view path_str) {
+  if (ok) {
+    g_io.opens_ok.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    g_io.open_misses.fetch_add(1, std::memory_order_relaxed);
+  }
+  g_io.us_opens.fetch_add(us, std::memory_order_relaxed);
+  MaxAtomic(g_io.us_open_worst, us);
+
+  const int32_t warning_ms = REXCVAR_GET(switch_io_warning_ms);
+  if (warning_ms > 0 && us >= static_cast<uint64_t>(warning_ms) * 1000ull &&
+      g_io_warnings.fetch_add(1, std::memory_order_relaxed) < 300) {
+    REXKRNL_WARN("[io] SLOW: opening '{}' took {:.1f} ms ({})", path_str, us / 1000.0,
+                 ok ? "opened" : "does not exist");
+  }
+}
+
+inline void AnnotateRead(uint64_t us, uint32_t bytes, const std::string_view path_str,
+                          uint64_t offset_bytes) {
+  g_io.reads.fetch_add(1, std::memory_order_relaxed);
+  g_io.bytes_read.fetch_add(bytes, std::memory_order_relaxed);
+  g_io.us_reads.fetch_add(us, std::memory_order_relaxed);
+  MaxAtomic(g_io.us_read_worst, us);
+
+  const bool reread = AnnotateRange(path_str, offset_bytes, bytes);
+
+  const int32_t warning_ms = REXCVAR_GET(switch_io_warning_ms);
+  if (warning_ms > 0 && us >= static_cast<uint64_t>(warning_ms) * 1000ull &&
+      g_io_warnings.fetch_add(1, std::memory_order_relaxed) < 300) {
+    // The offset is included. Without it a sequential sweep cannot be told apart from a reread.
+    REXKRNL_WARN("[io] SLOW: reading {} bytes of '{}' at {} took {:.1f} ms{}", bytes, path_str,
+                 offset_bytes, us / 1000.0, reread ? " (REREAD)" : "");
+  }
+}
+
+}  // namespace
+
+// Switch layer: last .wmv movie opened by the game. The app reopens it through the VFS and decodes it
+// natively with FFmpeg, because the recompiled XDK WMV decoder does not reach real time on the
+// Switch.
+namespace {
+std::mutex g_wmv_mutex;
+std::string g_last_wmv;
+std::vector<std::pair<const rex::filesystem::Entry*, std::string>> g_wmv_opened;
+std::string g_last_wmv_read;
+
+void IoAnnotateOpen(const rex::filesystem::Entry* entry, const std::string& path_str) {
+  std::lock_guard<std::mutex> lock(g_wmv_mutex);
+  g_last_wmv = path_str;
+  for (auto& [e, r] : g_wmv_opened) {
+    if (e == entry) {
+      r = path_str;
+      return;
+    }
+  }
+  if (g_wmv_opened.size() >= 64) {
+    g_wmv_opened.erase(g_wmv_opened.begin());
+  }
+  g_wmv_opened.emplace_back(entry, path_str);
+  REXLOG_INFO("[video] the game opens '{}'", path_str);
+}
+
+void IoAnnotateRead(const rex::filesystem::Entry* entry) {
+  std::lock_guard<std::mutex> lock(g_wmv_mutex);
+  for (const auto& [e, r] : g_wmv_opened) {
+    if (e == entry) {
+      if (r != g_last_wmv_read) {
+        g_last_wmv_read = r;
+        REXLOG_INFO("[video] the game reads '{}'", r);
+      }
+      return;
+    }
+  }
+}
+}  // namespace
+
+std::string LastWmvOpened() {
+  std::lock_guard<std::mutex> lock(g_wmv_mutex);
+  return g_last_wmv;
+}
+
+// Switch layer: last .wmv movie read by the game: the one being played.
+std::string LastWmvRead() {
+  std::lock_guard<std::mutex> lock(g_wmv_mutex);
+  return g_last_wmv_read;
+}
+
+struct CreateOptions {
+  // https://processhacker.sourceforge.io/doc/ntioapi_8h.html
+  static const uint32_t FILE_DIRECTORY_FILE = 0x00000001;
+  // Optimization - files access will be sequential, not random.
+  static const uint32_t FILE_SEQUENTIAL_ONLY = 0x00000004;
+  static const uint32_t FILE_SYNCHRONOUS_IO_ALERT = 0x00000010;
+  static const uint32_t FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020;
+  static const uint32_t FILE_NON_DIRECTORY_FILE = 0x00000040;
+  // Optimization - file access will be random, not sequential.
+  static const uint32_t FILE_RANDOM_ACCESS = 0x00000800;
+};
+
+static bool IsValidPath(const std::string_view s, bool is_pattern) {
+
+  bool got_asterisk = false;
+  for (const auto& c : s) {
+    if (c <= 31 || c >= 127) {
+      return false;
+    }
+    if (got_asterisk) {
+      // * must be followed by a . (*.)
+      //
+      // 4D530819 has a bug in its game code where it attempts to
+      // FindFirstFile() with filters of "Game:\\*_X3.rkv", "Game:\\m*_X3.rkv",
+      // and "Game:\\w*_X3.rkv" and will infinite loop if the path filter is
+      // allowed.
+      if (c != '.') {
+        return false;
+      }
+      got_asterisk = false;
+    }
+    switch (c) {
+      case '"':
+      // case '*':
+      case '+':
+      case ',':
+      // case ':':
+      // case ';':
+      case '<':
+      // case '=':
+      case '>':
+      // case '?':
+      case '|': {
+        return false;
+      }
+      case '*': {
+        // Pattern-specific (for NtQueryDirectoryFile)
+        if (!is_pattern) {
+          return false;
+        }
+        got_asterisk = true;
+        break;
+      }
+      case '?': {
+        // Pattern-specific (for NtQueryDirectoryFile)
+        if (!is_pattern) {
+          return false;
+        }
+        break;
+      }
+      default: {
+        break;
+      }
+    }
+  }
+  return true;
+}
+
+u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+                       ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attrs,
+                       ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
+                       u32 file_attributes, u32 share_access, u32 creation_disposition,
+                       u32 create_options) {
+
+  // uint64_t allocation_size = 0;  // is this correct???
+  // if (allocation_size_ptr) {
+  //  allocation_size = *allocation_size_ptr;
+  //}
+
+  if (!object_attrs) {
+    // ..? Some games do this. This parameter is not optional.
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  assert_not_null(handle_out);
+
+  auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
+
+  rex::filesystem::Entry* root_entry = nullptr;
+
+  // Compute path, possibly attrs relative.
+  auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+  REXKRNL_IMPORT_TRACE(
+      "NtCreateFile", "path={} access={:#x} attrs={:#x} share={:#x} disp={:#x} options={:#x}",
+      target_path, (uint32_t)desired_access, (uint32_t)file_attributes, (uint32_t)share_access,
+      (uint32_t)creation_disposition, (uint32_t)create_options);
+
+  // Enforce that the path is ASCII.
+  if (!IsValidPath(target_path, false)) {
+    return X_STATUS_OBJECT_NAME_INVALID;
+  }
+
+  if (object_attrs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
+      object_attrs->root_directory != 0) {
+    auto root_file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(object_attrs->root_directory);
+    assert_not_null(root_file);
+    assert_true(root_file->type() == XObject::Type::File);
+
+    root_entry = root_file->entry();
+  }
+
+  // Attempt open (or create).
+  rex::filesystem::File* vfs_file;
+  rex::filesystem::FileAction file_action;
+  const uint64_t io_start_us = NowUs();
+  X_STATUS result = REX_KERNEL_FS()->OpenFile(
+      root_entry, target_path, rex::filesystem::FileDisposition((uint32_t)creation_disposition),
+      desired_access, (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
+      (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file, &file_action);
+  const uint64_t io_end_us = NowUs();
+  AnnotateOpen(io_end_us - io_start_us, XSUCCEEDED(result), target_path);
+  MaybeSummaryIo(io_end_us);
+  object_ref<XFile> file = nullptr;
+
+  X_HANDLE handle = X_INVALID_HANDLE_VALUE;
+  if (XSUCCEEDED(result)) {
+    // If true, desired_access SYNCHRONIZE flag must be set.
+    bool synchronous = (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_ALERT) ||
+                       (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT);
+    file = object_ref<XFile>(new XFile(REX_KERNEL_STATE(), vfs_file, synchronous));
+
+    // Handle ref is incremented, so return that.
+    handle = file->handle();
+
+    // Switch layer: records the .wmv movies (see LastWmvOpened).
+    if (target_path.size() > 4) {
+      std::string extension(target_path.substr(target_path.size() - 4));
+      for (char& c : extension) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      if (extension == ".wmv") {
+        IoAnnotateOpen(vfs_file->entry(), std::string(target_path));
+      }
+    }
+  }
+
+  if (io_status_block) {
+    io_status_block->status = result;
+    io_status_block->information = (uint32_t)file_action;
+  }
+
+  *handle_out = handle;
+  if (XFAILED(result)) {
+    REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
+  } else {
+    REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
+  }
+  return result;
+}
+
+u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
+                     ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attributes,
+                     ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, u32 open_options) {
+  return NtCreateFile_entry(handle_out, desired_access, object_attributes, io_status_block, nullptr,
+                            0, 0, static_cast<uint32_t>(rex::filesystem::FileDisposition::kOpen),
+                            open_options);
+}
+
+u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
+                     mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                     mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
+  uint64_t byte_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : 0;
+  const bool apc_requested = (static_cast<uint32_t>(apc_routine_ptr) & ~1u) != 0;
+  REXKRNL_IMPORT_TRACE(
+      "NtReadFile",
+      "handle={:#x} event={:#x} apc={:#x} apc_ctx={:#x} iosb={:#x} buf={:#x} len={:#x} offset={}",
+      (uint32_t)file_handle, (uint32_t)event_handle, apc_routine_ptr.guest_address(),
+      apc_context.guest_address(), io_status_block.guest_address(), buffer.guest_address(),
+      (uint32_t)buffer_length, byte_offset_ptr ? (int64_t)byte_offset : -1);
+  X_STATUS result = X_STATUS_SUCCESS;
+  bool apc_queued = false;
+
+  // Switch layer: last .wmv movie read (see LastWmvRead).
+  if (auto was_read = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle)) {
+    IoAnnotateRead(was_read->entry());
+  }
+
+  bool signal_event = false;
+  auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
+  if (event_handle && !ev) {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+  if (!file) {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  if (XSUCCEEDED(result)) {
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if (true || file->is_synchronous()) {
+      // Synchronous.
+      uint32_t bytes_read = 0;
+      // Where the read starts. If no offset is given, the game reads from the file position.
+      const uint64_t offset_bytes =
+          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : file->position();
+      const uint64_t io_start_us = NowUs();
+      result = file->Read(buffer.guest_address(), buffer_length,
+                          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
+                          &bytes_read, apc_context.guest_address());
+      const uint64_t io_end_us = NowUs();
+      AnnotateRead(io_end_us - io_start_us, bytes_read, file->path(), offset_bytes);
+      MaybeSummaryIo(io_end_us);
+      if (io_status_block) {
+        io_status_block->status = result;
+        io_status_block->information = bytes_read;
+      }
+
+      // Queue the APC callback. It must be delivered via the APC mechanism even
+      // though were are completing immediately.
+      // Low bit probably means do not queue to IO ports.
+      if ((uint32_t)apc_routine_ptr & ~1) {
+        if (apc_context && result == X_STATUS_SUCCESS) {
+          auto thread = XThread::GetCurrentThread();
+          uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr) & ~1u;
+          uint32_t apc_ctx = apc_context.guest_address();
+          uint32_t apc_arg1 = io_status_block.guest_address();
+          REXKRNL_IMPORT_TRACE("NtReadFile",
+                               "queue_apc thid={} normal={:#x} ctx={:#x} arg1={:#x} arg2=0",
+                               thread ? thread->thread_id() : 0, apc_routine, apc_ctx, apc_arg1);
+          thread->EnqueueApc(apc_routine, apc_ctx, apc_arg1, 0);
+          apc_queued = true;
+        } else {
+          REXKRNL_IMPORT_TRACE("NtReadFile", "skip_apc_queue (apc_ctx={:#x}, status={:#x})",
+                               apc_context.guest_address(), result);
+        }
+      }
+
+      if (!file->is_synchronous() && result != X_STATUS_END_OF_FILE) {
+        result = X_STATUS_PENDING;
+      }
+
+      // Mark that we should signal the event now. We do this after
+      // we have written the info out.
+      signal_event = true;
+    } else {
+
+
+      // X_STATUS_PENDING if not returning immediately.
+      // XFile is waitable and signalled after each async req completes.
+      // reset the input event (->Reset())
+      /*xeNtReadFileState* call_state = new xeNtReadFileState();
+      XAsyncRequest* request = new XAsyncRequest(
+      state, file,
+      (XAsyncRequest::CompletionCallback)xeNtReadFileCompleted,
+      call_state);*/
+      // result = file->Read(buffer.guest_address(), buffer_length, byte_offset,
+      //                     request);
+      if (io_status_block) {
+        io_status_block->status = X_STATUS_PENDING;
+        io_status_block->information = 0;
+      }
+
+      result = X_STATUS_PENDING;
+    }
+  }
+
+  if (XFAILED(result) && io_status_block) {
+    io_status_block->status = result;
+    io_status_block->information = 0;
+  }
+
+  if (ev && signal_event) {
+    ev->Set(0, false);
+  }
+
+  // Log detailed completion info for debugging async IO issues
+  if (file) {
+    REXKRNL_IMPORT_RESULT(
+        "NtReadFile",
+        "{:#x} (sync={}, iosb_status={:#x}, iosb_info={}, ev_signaled={}, apc_requested={}, "
+        "apc_queued={})",
+        result, file->is_synchronous(),
+        io_status_block ? (uint32_t)io_status_block->status : 0xDEAD,
+        io_status_block ? (uint32_t)io_status_block->information : 0, ev && signal_event,
+        apc_requested, apc_queued);
+  } else {
+    REXKRNL_IMPORT_RESULT("NtReadFile", "{:#x} (apc_requested={}, apc_queued={})", result,
+                          apc_requested, apc_queued);
+  }
+  return result;
+}
+
+u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
+                            mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                            mapped_u32 segment_array, u32 length, mapped_u64 byte_offset_ptr) {
+  X_STATUS result = X_STATUS_SUCCESS;
+
+  bool signal_event = false;
+  auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
+  if (event_handle && !ev) {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+  if (!file) {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  if (XSUCCEEDED(result)) {
+    if (true || file->is_synchronous()) {
+      // Synchronous.
+      uint32_t bytes_read = 0;
+      result = file->ReadScatter(segment_array.guest_address(), length,
+                                 byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
+                                 &bytes_read, apc_context.guest_address());
+      if (io_status_block) {
+        io_status_block->status = result;
+        io_status_block->information = bytes_read;
+      }
+
+      // Queue the APC callback. It must be delivered via the APC mechanism even
+      // though were are completing immediately.
+      // Low bit probably means do not queue to IO ports.
+      if ((uint32_t)apc_routine_ptr & ~1) {
+        if (apc_context) {
+          auto thread = XThread::GetCurrentThread();
+          thread->EnqueueApc(static_cast<uint32_t>(apc_routine_ptr) & ~1u,
+                             apc_context.guest_address(), io_status_block.guest_address(), 0);
+        }
+      }
+
+      if (!file->is_synchronous()) {
+        result = X_STATUS_PENDING;
+      }
+
+      // Mark that we should signal the event now. We do this after
+      // we have written the info out.
+      signal_event = true;
+    } else {
+
+
+
+      // here instead of handling it ourselves
+
+      // X_STATUS_PENDING if not returning immediately.
+      // XFile is waitable and signalled after each async req completes.
+      // reset the input event (->Reset())
+      /*xeNtReadFileState* call_state = new xeNtReadFileState();
+      XAsyncRequest* request = new XAsyncRequest(
+      state, file,
+      (XAsyncRequest::CompletionCallback)xeNtReadFileCompleted,
+      call_state);*/
+      // result = file->Read(buffer.guest_address(), buffer_length, byte_offset,
+      //                     request);
+      if (io_status_block) {
+        io_status_block->status = X_STATUS_PENDING;
+        io_status_block->information = 0;
+      }
+
+      result = X_STATUS_PENDING;
+    }
+  }
+
+  if (XFAILED(result) && io_status_block) {
+    io_status_block->status = result;
+    io_status_block->information = 0;
+  }
+
+  if (ev && signal_event) {
+    ev->Set(0, false);
+  }
+
+  return result;
+}
+
+u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped_void apc_context,
+                      ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_void buffer,
+                      u32 buffer_length, mapped_u64 byte_offset_ptr) {
+  X_STATUS result = X_STATUS_SUCCESS;
+
+  // Grab event to signal.
+  bool signal_event = false;
+  auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
+  if (event_handle && !ev) {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  // Grab file.
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+  if (!file) {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+
+  // Execute write.
+  if (XSUCCEEDED(result)) {
+
+    if (true || file->is_synchronous()) {
+      // Synchronous request.
+      uint32_t bytes_written = 0;
+      result = file->Write(buffer.guest_address(), buffer_length,
+                           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
+                           &bytes_written, apc_context.guest_address());
+
+      if (io_status_block) {
+        io_status_block->status = result;
+        io_status_block->information = static_cast<uint32_t>(bytes_written);
+      }
+
+      // Queue the APC callback. It must be delivered via the APC mechanism even
+      // though were are completing immediately.
+      // Low bit probably means do not queue to IO ports.
+      if ((uint32_t)apc_routine & ~1) {
+        if (apc_context) {
+          auto thread = XThread::GetCurrentThread();
+          thread->EnqueueApc(static_cast<uint32_t>(apc_routine) & ~1u, apc_context.guest_address(),
+                             io_status_block.guest_address(), 0);
+        }
+      }
+
+      if (!file->is_synchronous()) {
+        result = X_STATUS_PENDING;
+      }
+
+      // Mark that we should signal the event now. We do this after
+      // we have written the info out.
+      signal_event = true;
+    } else {
+      // X_STATUS_PENDING if not returning immediately.
+      result = X_STATUS_PENDING;
+
+      if (io_status_block) {
+        io_status_block->status = X_STATUS_PENDING;
+        io_status_block->information = 0;
+      }
+    }
+  }
+
+  if (XFAILED(result) && io_status_block) {
+    io_status_block->status = result;
+    io_status_block->information = 0;
+  }
+
+  if (ev && signal_event) {
+    ev->Set(0, false);
+  }
+
+  return result;
+}
+
+u32 NtCreateIoCompletion_entry(mapped_u32 out_handle, u32 desired_access,
+                               mapped_void object_attribs, u32 num_concurrent_threads) {
+  auto completion = new XIOCompletion(REX_KERNEL_STATE());
+  if (out_handle) {
+    *out_handle = completion->handle();
+  }
+
+  return X_STATUS_SUCCESS;
+}
+
+u32 NtSetIoCompletion_entry(u32 handle, u32 key_context, u32 apc_context, u32 completion_status,
+                            u32 num_bytes) {
+  auto port = REX_KERNEL_OBJECTS()->LookupObject<XIOCompletion>(handle);
+  if (!port) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+
+  XIOCompletion::IONotification notification;
+  notification.key_context = key_context;
+  notification.apc_context = apc_context;
+  notification.num_bytes = num_bytes;
+  notification.status = completion_status;
+
+  port->QueueNotification(notification);
+  return X_STATUS_SUCCESS;
+}
+
+// Dequeues a packet from the completion port.
+u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 apc_context,
+                               ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 timeout) {
+  X_STATUS status = X_STATUS_SUCCESS;
+  // uint32_t info = 0;
+
+  auto port = REX_KERNEL_OBJECTS()->LookupObject<XIOCompletion>(handle);
+  if (!port) {
+    status = X_STATUS_INVALID_HANDLE;
+  }
+
+  uint64_t timeout_ticks = timeout ? static_cast<uint32_t>(*timeout)
+                                   : static_cast<uint64_t>(std::numeric_limits<int64_t>::min());
+  XIOCompletion::IONotification notification;
+  if (port->WaitForNotification(timeout_ticks, &notification)) {
+    if (key_context) {
+      *key_context = notification.key_context;
+    }
+    if (apc_context) {
+      *apc_context = notification.apc_context;
+    }
+
+    if (io_status_block) {
+      io_status_block->status = notification.status;
+      io_status_block->information = notification.num_bytes;
+    }
+  } else {
+    status = X_STATUS_TIMEOUT;
+  }
+
+  return status;
+}
+
+u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
+                                    ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
+  auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr);
+  auto path_str = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+  REXKRNL_IMPORT_TRACE("NtQueryFullAttributesFile", "path={}", path_str);
+
+  object_ref<XFile> root_file;
+  if (obj_attribs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
+      obj_attribs->root_directory != 0) {
+    root_file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(obj_attribs->root_directory);
+    assert_not_null(root_file);
+    assert_true(root_file->type() == XObject::Type::File);
+    assert_always();
+  }
+
+  auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+
+  // Enforce that the path is ASCII.
+  if (!IsValidPath(target_path, false)) {
+    return X_STATUS_OBJECT_NAME_INVALID;
+  }
+
+  // Resolve the file using the virtual file system.
+  auto entry = REX_KERNEL_FS()->ResolvePath(target_path);
+  if (entry) {
+    // Found.
+    file_info->creation_time = entry->create_timestamp();
+    file_info->last_access_time = entry->access_timestamp();
+    file_info->last_write_time = entry->write_timestamp();
+    file_info->change_time = entry->write_timestamp();
+    file_info->allocation_size = entry->allocation_size();
+    file_info->end_of_file = entry->size();
+    file_info->attributes = entry->attributes();
+
+    REXKRNL_IMPORT_RESULT("NtQueryFullAttributesFile", "0x0 size={}", (uint64_t)entry->size());
+    return X_STATUS_SUCCESS;
+  }
+
+  REXKRNL_IMPORT_RESULT("NtQueryFullAttributesFile", "X_STATUS_NO_SUCH_FILE");
+  return X_STATUS_NO_SUCH_FILE;
+}
+
+u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine,
+                               mapped_void apc_context,
+                               ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                               ppc_ptr_t<X_FILE_DIRECTORY_INFORMATION> file_info_ptr, u32 length,
+                               ppc_ptr_t<X_ANSI_STRING> file_name, u32 restart_scan) {
+  if (length < 72) {
+    return X_STATUS_INFO_LENGTH_MISMATCH;
+  }
+
+  X_STATUS result = X_STATUS_UNSUCCESSFUL;
+  uint32_t info = 0;
+
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+  auto name = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), file_name);
+
+  // Enforce that the path is ASCII.
+  if (!IsValidPath(name, true)) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  if (file) {
+    // X_FILE_DIRECTORY_INFORMATION dir_info = {0};
+    result = file->QueryDirectory(file_info_ptr, length, name, restart_scan != 0);
+    if (XSUCCEEDED(result)) {
+      info = length;
+    }
+  } else {
+    result = X_STATUS_NO_SUCH_FILE;
+  }
+
+  if (XFAILED(result)) {
+    info = 0;
+  }
+
+  if (io_status_block) {
+    io_status_block->status = result;
+    io_status_block->information = info;
+  }
+
+  return result;
+}
+
+/*
+ * This used to lie: it returned SUCCESS without even looking at the handle.
+ *
+ * The game calls it right after saving: it is its way of saying "this must be on disk now". If
+ * nobody honors it, what was written is at the mercy of whenever the file system decides to flush
+ * it, and on the Switch that means that leaving through the HOME menu or turning the console off
+ * right after saving can leave the save half written on the SD, which shows up as the game's
+ * damaged-profile message.
+ */
+u32 NtFlushBuffersFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {
+  auto result = X_STATUS_SUCCESS;
+
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+  if (!file) {
+    result = X_STATUS_INVALID_HANDLE;
+  } else {
+    result = file->Flush();
+    static std::atomic<uint32_t> warnings{0};
+    if (warnings.fetch_add(1, std::memory_order_relaxed) < 16) {
+      REXKRNL_INFO("[save] NtFlushBuffersFile: {} flushed to disk (result {:08X})",
+                   file->path(), uint32_t(result));
+    }
+  }
+
+  if (io_status_block_ptr) {
+    io_status_block_ptr->status = result;
+    io_status_block_ptr->information = 0;
+  }
+
+  return result;
+}
+
+// https://docs.microsoft.com/en-us/windows/win32/devnotes/ntopensymboliclinkobject
+u32 NtOpenSymbolicLinkObject_entry(mapped_u32 handle_out,
+                                   ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attrs) {
+  if (!object_attrs) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  assert_not_null(handle_out);
+
+  assert_true(object_attrs->attributes == 64);  // case insensitive
+
+  auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
+
+  auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+
+  // Enforce that the path is ASCII.
+  if (!IsValidPath(target_path, false)) {
+    return X_STATUS_OBJECT_NAME_INVALID;
+  }
+
+  if (object_attrs->root_directory != 0) {
+    assert_always();
+  }
+
+  if (rex::string::utf8_starts_with(target_path, "\\??\\")) {
+    target_path = target_path.substr(4);  // Strip the full qualifier
+  }
+
+  std::string link_path;
+  if (!REX_KERNEL_FS()->FindSymbolicLink(target_path, link_path)) {
+    return X_STATUS_NO_SUCH_FILE;
+  }
+
+  object_ref<XSymbolicLink> symlink(new XSymbolicLink(REX_KERNEL_STATE()));
+  symlink->Initialize(target_path, link_path);
+
+  *handle_out = symlink->handle();
+
+  return X_STATUS_SUCCESS;
+}
+
+// https://docs.microsoft.com/en-us/windows/win32/devnotes/ntquerysymboliclinkobject
+u32 NtQuerySymbolicLinkObject_entry(u32 handle, ppc_ptr_t<X_ANSI_STRING> target) {
+  auto symlink = REX_KERNEL_OBJECTS()->LookupObject<XSymbolicLink>(handle);
+  if (!symlink) {
+    return X_STATUS_NO_SUCH_FILE;
+  }
+  auto length = std::min(static_cast<size_t>(target->maximum_length), symlink->target().size());
+  if (length > 0) {
+    auto target_buf = REX_KERNEL_MEMORY()->TranslateVirtual(target->pointer);
+    std::memcpy(target_buf, symlink->target().c_str(), length);
+  }
+  target->length = static_cast<uint16_t>(length);
+  return X_STATUS_SUCCESS;
+}
+
+u32 FscGetCacheElementCount_entry(u32 r3) {
+  return 0;
+}
+
+u32 FscSetCacheElementCount_entry(u32 unk_0, u32 unk_1) {
+  // unk_0 = 0
+  // unk_1 looks like a count? in what units? 256 is a common value
+  return X_STATUS_SUCCESS;
+}
+
+u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u32 apc_context,
+                                u32 io_status_block, u32 io_control_code, mapped_void input_buffer,
+                                u32 input_buffer_len, mapped_void output_buffer,
+                                u32 output_buffer_len) {
+  // Called by XMountUtilityDrive cache-mounting code
+  // (checks if the returned values look valid, values below seem to pass the
+  // checks)
+  const uint32_t cache_size = 0xFF000;
+
+  const uint32_t X_IOCTL_DISK_GET_DRIVE_GEOMETRY = 0x70000;
+  const uint32_t X_IOCTL_DISK_GET_PARTITION_INFO = 0x74004;
+
+  if (io_control_code == X_IOCTL_DISK_GET_DRIVE_GEOMETRY) {
+    if (output_buffer_len < 0x8) {
+      assert_always();
+      return X_STATUS_BUFFER_TOO_SMALL;
+    }
+    memory::store_and_swap<uint32_t>(output_buffer, cache_size / 512);
+    memory::store_and_swap<uint32_t>(output_buffer + 4, 512);
+  } else if (io_control_code == X_IOCTL_DISK_GET_PARTITION_INFO) {
+    if (output_buffer_len < 0x10) {
+      assert_always();
+      return X_STATUS_BUFFER_TOO_SMALL;
+    }
+    memory::store_and_swap<uint64_t>(output_buffer, 0);
+    memory::store_and_swap<uint64_t>(output_buffer + 8, cache_size);
+  } else {
+    REXKRNL_DEBUG("NtDeviceIoControlFile(0x{:X}) - unhandled IOCTL!", uint32_t(io_control_code));
+    assert_always();
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  return X_STATUS_SUCCESS;
+}
+
+u32 IoCreateDevice_entry(u32 device_struct, u32 r4, u32 r5, u32 r6, u32 r7, mapped_u32 out_struct) {
+  // Called from XMountUtilityDrive XAM-task code
+  // That code tries writing things to a pointer at out_struct+0x18
+  // We'll alloc some scratch space for it so it doesn't cause any exceptions
+
+  // 0x24 is guessed size from accesses to out_struct - likely incorrect
+  auto out_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(0x24);
+
+  auto out = REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(out_guest);
+  memset(out, 0, 0x24);
+
+  // XMountUtilityDrive writes some kind of header here
+  // 0x1000 bytes should be enough to store it
+  auto out_guest2 = REX_KERNEL_MEMORY()->SystemHeapAlloc(0x1000);
+  memory::store_and_swap(out + 0x18, out_guest2);
+
+  *out_struct = out_guest;
+  return X_STATUS_SUCCESS;
+}
+
+u32 IoDismountVolumeByFileHandle_entry(u32 handle) {
+  REXKRNL_WARN("IoDismountVolumeByFileHandle({:#x}) - stub", (uint32_t)handle);
+  return X_STATUS_SUCCESS;
+}
+
+u32 IoDismountVolumeByName_entry(ppc_ptr_t<X_ANSI_STRING> name) {
+  REXKRNL_WARN("IoDismountVolumeByName - stub");
+  return X_STATUS_SUCCESS;
+}
+
+u32 IoSynchronousDeviceIoControlRequest_entry(u32 ioctl, mapped_void device_object,
+                                              mapped_void input_buffer, u32 input_length,
+                                              mapped_void output_buffer, u32 output_length,
+                                              mapped_u32 returned_length, u32 unk) {
+  REXKRNL_WARN("IoSynchronousDeviceIoControlRequest({:#x}) - stub", (uint32_t)ioctl);
+  return X_STATUS_SUCCESS;
+}
+
+u32 StfsCreateDevice_entry(mapped_void device_object, u32 flags, mapped_u32 out_device) {
+  REXKRNL_WARN("StfsCreateDevice - stub");
+  // if (out_device) *out_device = 0;
+  return X_STATUS_SUCCESS;
+}
+
+u32 StfsControlDevice_entry(mapped_void device_object, u32 ioctl, mapped_void input_buffer,
+                            u32 input_length, mapped_void output_buffer, u32 output_length) {
+  REXKRNL_WARN("StfsControlDevice({:#x}) - stub", (uint32_t)ioctl);
+  return X_STATUS_SUCCESS;
+}
+
+}  // namespace rex::kernel::xboxkrnl
+
+REX_EXPORT(__imp__NtCreateFile, rex::kernel::xboxkrnl::NtCreateFile_entry)
+REX_EXPORT(__imp__NtOpenFile, rex::kernel::xboxkrnl::NtOpenFile_entry)
+REX_EXPORT(__imp__NtReadFile, rex::kernel::xboxkrnl::NtReadFile_entry)
+REX_EXPORT(__imp__NtReadFileScatter, rex::kernel::xboxkrnl::NtReadFileScatter_entry)
+REX_EXPORT(__imp__NtWriteFile, rex::kernel::xboxkrnl::NtWriteFile_entry)
+REX_EXPORT(__imp__NtCreateIoCompletion, rex::kernel::xboxkrnl::NtCreateIoCompletion_entry)
+REX_EXPORT(__imp__NtSetIoCompletion, rex::kernel::xboxkrnl::NtSetIoCompletion_entry)
+REX_EXPORT(__imp__NtRemoveIoCompletion, rex::kernel::xboxkrnl::NtRemoveIoCompletion_entry)
+REX_EXPORT(__imp__NtQueryFullAttributesFile, rex::kernel::xboxkrnl::NtQueryFullAttributesFile_entry)
+REX_EXPORT(__imp__NtQueryDirectoryFile, rex::kernel::xboxkrnl::NtQueryDirectoryFile_entry)
+REX_EXPORT(__imp__NtFlushBuffersFile, rex::kernel::xboxkrnl::NtFlushBuffersFile_entry)
+REX_EXPORT(__imp__NtOpenSymbolicLinkObject, rex::kernel::xboxkrnl::NtOpenSymbolicLinkObject_entry)
+REX_EXPORT(__imp__NtQuerySymbolicLinkObject, rex::kernel::xboxkrnl::NtQuerySymbolicLinkObject_entry)
+REX_EXPORT(__imp__FscGetCacheElementCount, rex::kernel::xboxkrnl::FscGetCacheElementCount_entry)
+REX_EXPORT(__imp__FscSetCacheElementCount, rex::kernel::xboxkrnl::FscSetCacheElementCount_entry)
+REX_EXPORT(__imp__NtDeviceIoControlFile, rex::kernel::xboxkrnl::NtDeviceIoControlFile_entry)
+REX_EXPORT(__imp__IoCreateDevice, rex::kernel::xboxkrnl::IoCreateDevice_entry)
+REX_EXPORT(__imp__IoDismountVolumeByFileHandle,
+           rex::kernel::xboxkrnl::IoDismountVolumeByFileHandle_entry)
+REX_EXPORT(__imp__IoDismountVolumeByName, rex::kernel::xboxkrnl::IoDismountVolumeByName_entry)
+REX_EXPORT(__imp__IoSynchronousDeviceIoControlRequest,
+           rex::kernel::xboxkrnl::IoSynchronousDeviceIoControlRequest_entry)
+REX_EXPORT(__imp__StfsCreateDevice, rex::kernel::xboxkrnl::StfsCreateDevice_entry)
+REX_EXPORT(__imp__StfsControlDevice, rex::kernel::xboxkrnl::StfsControlDevice_entry)
+
+REX_EXPORT_STUB(__imp__IoAcquireDeviceObjectLock);
+REX_EXPORT_STUB(__imp__IoAllocateIrp);
+REX_EXPORT_STUB(__imp__IoBuildAsynchronousFsdRequest);
+REX_EXPORT_STUB(__imp__IoBuildDeviceIoControlRequest);
+REX_EXPORT_STUB(__imp__IoBuildSynchronousFsdRequest);
+REX_EXPORT_STUB(__imp__IoCallDriver);
+REX_EXPORT_STUB(__imp__IoCheckShareAccess);
+REX_EXPORT_STUB(__imp__IoCompleteRequest);
+REX_EXPORT_STUB(__imp__IoCreateFile);
+REX_EXPORT_STUB(__imp__IoDeleteDevice);
+REX_EXPORT_STUB(__imp__IoDismountVolume);
+REX_EXPORT_STUB(__imp__IoFreeIrp);
+REX_EXPORT_STUB(__imp__IoInitializeIrp);
+REX_EXPORT_STUB(__imp__IoInvalidDeviceRequest);
+REX_EXPORT_STUB(__imp__IoQueueThreadIrp);
+REX_EXPORT_STUB(__imp__IoReleaseDeviceObjectLock);
+REX_EXPORT_STUB(__imp__IoRemoveShareAccess);
+REX_EXPORT_STUB(__imp__IoSetIoCompletion);
+REX_EXPORT_STUB(__imp__IoSetShareAccess);
+REX_EXPORT_STUB(__imp__IoStartNextPacket);
+REX_EXPORT_STUB(__imp__IoStartNextPacketByKey);
+REX_EXPORT_STUB(__imp__IoStartPacket);
+REX_EXPORT_STUB(__imp__IoSynchronousFsdRequest);
+REX_EXPORT_STUB(__imp__NtDeleteFile);
+REX_EXPORT_STUB(__imp__NtSetSystemTime);
+REX_EXPORT_STUB(__imp__NtWriteFileGather);
+REX_EXPORT_STUB(__imp__IoAcquireCancelSpinLock);
+REX_EXPORT_STUB(__imp__IoReleaseCancelSpinLock);
+REX_EXPORT_STUB(__imp__NtCancelIoFile);
+REX_EXPORT_STUB(__imp__NtCancelIoFileEx);
+REX_EXPORT_STUB(__imp__SvodCreateDevice);
+
+REX_EXPORT_STUB(__imp__SataCdRomRecordReset);

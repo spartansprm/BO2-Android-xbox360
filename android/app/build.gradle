@@ -1,0 +1,120 @@
+plugins { id 'com.android.application' }
+def runtimeDir = providers.gradleProperty('bo2RuntimeDir').orNull
+def recompDir = providers.gradleProperty('bo2RecompDir').orNull
+def includeRuntime = runtimeDir != null && recompDir != null
+def includeProvider = runtimeDir != null
+
+
+if (providers.gradleProperty('bo2ShaderDir').orNull != null)
+    throw new GradleException('Bundled shader libraries are unsupported; import a library in the application')
+def gameDir = providers.gradleProperty('bo2GameDir').orNull
+def pipelineSeed = providers.gradleProperty('bo2PipelineSeed').orNull
+def includeGameApp = gameDir != null
+
+
+def campaignDir = providers.gradleProperty('bo2CampaignDir').orNull
+def includeCampaign = campaignDir != null
+def inputExtractor = providers.gradleProperty('bo2InputExtractor').getOrElse('false').toBoolean()
+if (!includeGameApp && !inputExtractor)
+    throw new GradleException('Build the playable APK with ./build.sh --inputs /path/to/inputs. Use -Pbo2InputExtractor=true only for the input extraction utility.')
+if (inputExtractor && (includeGameApp || includeProvider || includeCampaign))
+    throw new GradleException('The input extractor is built without game or runtime libraries')
+def mpXexSha = providers.gradleProperty('bo2MpXexSha256').getOrElse('7bd174dc01cf55ac378acad44aa29a447357bd3617214155b7aa7fa64c9a912d')
+def mpXexpSha = providers.gradleProperty('bo2MpXexpSha256').getOrElse('7f4ee5e4b5ccfe71786ddc073a0363558e89634bb26c2929335aeb7f883c9499')
+if (!(mpXexSha ==~ /[0-9a-f]{64}/) || !(mpXexpSha ==~ /[0-9a-f]{64}/))
+    throw new GradleException('Executable fingerprints must be lowercase SHA-256 values')
+if (includeCampaign && !includeGameApp) throw new GradleException('The campaign library requires the playable game (-Pbo2GameDir)')
+if (recompDir != null && !includeProvider) throw new GradleException('Private recomp requires the runtime directory')
+if (includeGameApp && !includeProvider) throw new GradleException('Full game requires the SDK')
+if (pipelineSeed != null && !includeGameApp) throw new GradleException('The private pipeline seed requires the playable game')
+
+android {
+    namespace 'org.bo2port.diagnostic'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+    ndkVersion '27.2.12479018'
+    buildFeatures { buildConfig true }
+    defaultConfig {
+        applicationId providers.gradleProperty('bo2ApplicationId').getOrElse('org.bo2port.diagnostic.scenesync')
+        minSdk 28
+        targetSdk 35
+        versionCode 550
+        versionName '0.55.0'
+        manifestPlaceholders = [bo2LauncherEnabled: (!inputExtractor).toString(), bo2ExtractorEnabled: inputExtractor.toString()]
+        buildConfigField 'String', 'BO2_MP_XEX_SHA256', "\"${mpXexSha}\""
+        buildConfigField 'String', 'BO2_MP_XEXP_SHA256', "\"${mpXexpSha}\""
+        buildConfigField 'int', 'BO2_REQUIRED_SHADER_COUNT', '32848'
+        buildConfigField 'boolean', 'BO2_RUNTIME_AVAILABLE', includeRuntime.toString()
+        buildConfigField 'boolean', 'BO2_PROVIDER_AVAILABLE', includeProvider.toString()
+        buildConfigField 'boolean', 'BO2_GAME_APP_AVAILABLE', includeGameApp.toString()
+        buildConfigField 'boolean', 'BO2_CAMPAIGN_AVAILABLE', includeCampaign.toString()
+        ndk { abiFilters 'arm64-v8a' }
+        if (!inputExtractor) externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_shared', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON'
+                if (includeProvider) arguments "-DBO2_ANDROID_RUNTIME_DIR=${runtimeDir}"
+                if (includeRuntime) arguments "-DBO2_ANDROID_RECOMP_DIR=${recompDir}"
+            }
+        }
+    }
+    if (!inputExtractor) externalNativeBuild {
+        cmake { path file('src/main/cpp/CMakeLists.txt'); version '3.22.1' }
+    }
+    sourceSets.main.java.srcDirs += ['../sdl3/android-project/app/src/main/java']
+    packaging.jniLibs.useLegacyPackaging = includeProvider
+    buildTypes {
+        debug { jniDebuggable true }
+        release { minifyEnabled false }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    lint { abortOnError true }
+    testOptions { unitTests.includeAndroidResources = true }
+}
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+}
+tasks.withType(Test).configureEach {
+    maxParallelForks = 1
+    maxHeapSize = '1536m'
+    ['http.proxyHost', 'http.proxyPort', 'https.proxyHost', 'https.proxyPort',
+     'http.nonProxyHosts', 'javax.net.ssl.trustStore', 'javax.net.ssl.trustStorePassword'].each { key ->
+        if (System.getProperty(key) != null) systemProperty key, System.getProperty(key)
+    }
+    systemProperty 'robolectric.dependency.repo.url', 'https://repo.maven.apache.org/maven2'
+    def testTemporary = layout.buildDirectory.dir('tmp/robolectric').get().asFile
+    def testPreviews = layout.buildDirectory.dir('reports/previews').get().asFile
+    systemProperty 'java.io.tmpdir', testTemporary.absolutePath
+    systemProperty 'bo2.landscape.preview.dir', testPreviews.absolutePath
+    doFirst { testTemporary.mkdirs(); testPreviews.mkdirs() }
+}
+if (includeGameApp) {
+    def gameLibraries=layout.buildDirectory.dir('generated/gameLibraries')
+    def stageGame=tasks.register('stageGameLibraries',Copy) {
+        from(file("${gameDir}/libbo2game.so"))
+        if (includeCampaign) from(file("${campaignDir}/libbo2cp.so"))
+        into(gameLibraries.map { it.dir('arm64-v8a') })
+        doFirst {
+            if(!file("${gameDir}/libbo2game.so").isFile()) throw new GradleException('Build libbo2game.so before packaging')
+            if(includeCampaign && !file("${campaignDir}/libbo2cp.so").isFile())
+                throw new GradleException('Build libbo2cp.so (android/game with -DBO2_ANDROID_CAMPAIGN=ON) before packaging')
+        }
+    }
+    android.sourceSets.main.jniLibs.srcDir(gameLibraries)
+    tasks.named('preBuild').configure { dependsOn stageGame }
+}
+if (pipelineSeed != null) {
+
+    def seededAssets=layout.buildDirectory.dir('generated/privatePipelineSeed')
+    def stageSeed=tasks.register('stagePrivatePipelineSeed', Exec) {
+        inputs.files(file(pipelineSeed), file('../../tools/stage_android_pipeline_seed.py'), file('../../tools/pipelines_list.py'))
+        outputs.dir(seededAssets)
+        commandLine 'python3', file('../../tools/stage_android_pipeline_seed.py').absolutePath,
+            '--input', file(pipelineSeed).absolutePath, '--output', seededAssets.get().asFile.absolutePath
+    }
+    android.sourceSets.main.assets.srcDir(seededAssets)
+    tasks.named('preBuild').configure { dependsOn stageSeed }
+}

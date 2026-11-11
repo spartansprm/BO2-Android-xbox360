@@ -1,0 +1,45 @@
+name: Source checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - run: python -m compileall -q tools
+      - run: python tools/test_build_android.py
+      - run: |
+          for script in build.sh tools/build_android_game.sh tools/build_android_native_sdk.sh tools/codegen.sh campaign/codegen.sh; do
+            bash -n "$script"
+          done
+      - run: g++ -std=c++20 -O2 -Iapp/src/native/render tools/test_android_v055.cpp -o /tmp/test-render
+      - run: /tmp/test-render
+  extractor:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - run: python tools/setup_android_diagnostic.py
+      - run: >-
+          bash android/gradlew -p android --no-daemon
+          -Pbo2InputExtractor=true -Pbo2ApplicationId=org.bo2port.inputextractor
+          :app:assembleRelease :app:lintRelease :app:testReleaseUnitTest
+          --tests org.bo2port.diagnostic.InputExtractorActivityTest

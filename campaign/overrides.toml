@@ -1,0 +1,30 @@
+setjmp_address = 0x826EC320
+longjmp_address = 0x826EC7B0
+
+
+skip_msr = true
+cr_as_local = true
+xer_as_local = true
+ctr_as_local = true
+non_volatile_as_local = true
+vector_scratch_as_local = true
+
+[functions]
+
+
+"0x823D20D8" = { }   # stw r4, 0x20(r3); blr   <- 0x8247D4F8
+
+
+"0x82603130" = { share_registers = true }
+"0x82604DE0" = { share_registers = true }
+"0x826055A0" = { share_registers = true }
+
+
+[rexcrt]
+bo2zm_memcpy = 0x826E94D0
+bo2zm_memmove = 0x826E9410
+bo2zm_memset = 0x826EB5D0
+bo2zm_xmemcpy = 0x825C06D8
+bo2zm_xmemset = 0x825C01A8
+bo2zm_bigcopy = 0x825C0578
+bo2zm_bigcopy2 = 0x825C0628

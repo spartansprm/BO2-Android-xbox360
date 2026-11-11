@@ -1,0 +1,9 @@
+gpu_plugin = "xenos"
+bo2zm_renderer = "native"
+
+
+bo2zm_show_fps = false
+
+
+bo2zm_boot_zombies = true
+bo2zm_zombies_only = true

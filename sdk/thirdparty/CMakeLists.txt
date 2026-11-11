@@ -1,0 +1,757 @@
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_vulkan_stack.cmake)
+
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
+
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+
+
+    if("arm64" IN_LIST CMAKE_OSX_ARCHITECTURES)
+        set(IS_ARM64 TRUE)
+        set(IS_X86_64 FALSE)
+    else()
+        set(IS_ARM64 FALSE)
+        set(IS_X86_64 TRUE)
+    endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    set(IS_ARM64 FALSE)
+    set(IS_X86_64 TRUE)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|ARM64|arm64)$")
+    set(IS_ARM64 TRUE)
+    set(IS_X86_64 FALSE)
+else()
+    set(IS_ARM64 FALSE)
+    set(IS_X86_64 FALSE)
+endif()
+
+
+set(REQUIRED_SUBMODULES
+    cli11
+    libmspack
+    FFmpeg
+    tomlplusplus
+    simde
+    xxHash
+    spdlog
+    fmt
+    utfcpp
+    imgui
+)
+
+
+if(NOT REXGLUE_PLATFORM_SWITCH AND NOT TARGET SDL3::SDL3)
+    list(APPEND REQUIRED_SUBMODULES sdl3)
+endif()
+
+if(REXGLUE_USE_VULKAN)
+    list(APPEND REQUIRED_SUBMODULES
+        vulkan-headers vulkan-memory-allocator
+        spirv-headers spirv-tools
+    )
+    if(NOT REXGLUE_RUNTIME_ONLY)
+        list(APPEND REQUIRED_SUBMODULES glslang)
+    endif()
+    if(APPLE)
+        list(APPEND REQUIRED_SUBMODULES vulkan-loader moltenvk)
+    endif()
+endif()
+
+
+if(REXGLUE_ENABLE_TRACY)
+    list(APPEND REQUIRED_SUBMODULES tracy)
+endif()
+
+if(REXGLUE_BUILD_TESTS)
+    list(APPEND REQUIRED_SUBMODULES catch2)
+endif()
+
+foreach(submodule ${REQUIRED_SUBMODULES})
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/.git")
+        message(FATAL_ERROR
+            "Git submodule '${submodule}' is not initialized.\n"
+            "Please run: git submodule update --init --recursive\n"
+            "from the repository root directory."
+        )
+    endif()
+endforeach()
+
+
+add_library(disruptorplus INTERFACE)
+target_include_directories(disruptorplus INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/disruptorplus/include>
+    $<INSTALL_INTERFACE:include/disruptorplus>)
+
+
+add_library(renderdoc INTERFACE)
+target_include_directories(renderdoc INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/renderdoc>
+    $<INSTALL_INTERFACE:include/renderdoc>)
+
+
+add_library(tomlplusplus INTERFACE)
+target_include_directories(tomlplusplus SYSTEM INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/tomlplusplus/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
+
+add_library(simde INTERFACE)
+target_include_directories(simde INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/simde>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/simde/simde>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
+
+add_library(tiny-aes STATIC
+    tiny-aes-c/aes.c
+)
+target_include_directories(tiny-aes PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tiny-aes-c)
+target_compile_definitions(tiny-aes PUBLIC AES128=1 CBC=1)
+
+
+add_library(aes128 STATIC
+    aes_128/aes.c
+)
+target_include_directories(aes128 PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
+target_compile_options(aes128 PRIVATE -w)
+
+
+set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/cabextract/mspack")
+add_library(mspack STATIC
+    ${MSPACK_DIR}/lzxd.c
+)
+target_include_directories(mspack PUBLIC
+    $<BUILD_INTERFACE:${MSPACK_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
+target_compile_options(mspack PRIVATE -w)
+
+
+add_library(o1heap STATIC
+    o1heap/o1heap/o1heap.c
+)
+target_include_directories(o1heap PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/o1heap/o1heap>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_definitions(o1heap PRIVATE
+    "O1HEAP_CONFIG_HEADER=\"${CMAKE_CURRENT_SOURCE_DIR}/../include/rex/o1heap_config.h\"")
+target_compile_options(o1heap PRIVATE -w)
+
+
+set(XXHASH_BUILD_XXHSUM OFF CACHE BOOL "" FORCE)
+add_subdirectory(xxHash/cmake_unofficial)
+target_compile_options(xxhash PRIVATE -w)
+
+
+add_subdirectory(disasm)
+
+target_compile_options(disasm PRIVATE -w)
+
+
+set(FMT_DOC OFF CACHE BOOL "" FORCE)
+set(FMT_TEST OFF CACHE BOOL "" FORCE)
+set(FMT_INSTALL ON CACHE BOOL "" FORCE)
+add_subdirectory(fmt)
+target_compile_options(fmt PRIVATE -w)
+
+
+set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+set(SPDLOG_INSTALL ON CACHE BOOL "" FORCE)
+add_subdirectory(spdlog)
+target_compile_options(spdlog PRIVATE -w)
+
+
+add_subdirectory(utfcpp)
+
+
+if(REXGLUE_USE_VULKAN)
+    message(STATUS "Vulkan stack: SDK ${REXGLUE_VULKAN_SDK_VERSION}")
+
+
+    set(VULKAN_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(VULKAN_HEADERS_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
+    set(VULKAN_HEADERS_ENABLE_MODULE OFF CACHE BOOL "" FORCE)
+    add_subdirectory(vulkan-headers)
+
+
+    set(VMA_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
+    add_subdirectory(vulkan-memory-allocator)
+
+    if(APPLE)
+
+
+        set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(BUILD_WERROR OFF CACHE BOOL "" FORCE)
+        set(LOADER_CODEGEN OFF CACHE BOOL "" FORCE)
+        string(REGEX REPLACE "\\.[0-9]+$" "" VulkanHeaders_VERSION
+            "${REXGLUE_VULKAN_SDK_VERSION}")
+        add_subdirectory(vulkan-loader EXCLUDE_FROM_ALL)
+        set_target_properties(vulkan PROPERTIES EXCLUDE_FROM_ALL FALSE)
+
+        set(MVK_BUILD_SHADER_CONVERTER_TOOL OFF CACHE BOOL "" FORCE)
+        set(MVK_EXCLUDE_SPIRV_TOOLS ON CACHE BOOL "" FORCE)
+        add_subdirectory(moltenvk)
+    endif()
+endif()
+
+
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_fidelityfx.cmake)
+
+
+set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/imgui")
+add_library(imgui OBJECT
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_demo.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+)
+add_library(imgui::imgui ALIAS imgui)
+target_include_directories(imgui PUBLIC
+    $<BUILD_INTERFACE:${IMGUI_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_options(imgui PRIVATE -w)
+if(REXGLUE_PLATFORM_SWITCH)
+
+    target_compile_definitions(imgui PRIVATE IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
+endif()
+
+
+if(NOT REXGLUE_PLATFORM_SWITCH AND NOT TARGET SDL3::SDL3)  # existing Android SDL target is shared
+set(SDL_INSTALL ON CACHE BOOL "" FORCE)
+set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+set(SDL_STATIC ON CACHE BOOL "" FORCE)
+set(SDL_TEST OFF CACHE BOOL "" FORCE)
+set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
+
+
+set(SDL_VIDEO ON CACHE BOOL "" FORCE)
+if(APPLE)
+
+    set(SDL_METAL ON CACHE BOOL "" FORCE)
+    set(SDL_VULKAN ON CACHE BOOL "" FORCE)
+else()
+    set(SDL_METAL OFF CACHE BOOL "" FORCE)
+
+
+    if(UNIX)
+        set(SDL_VULKAN ON CACHE BOOL "" FORCE)
+    else()
+        set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
+    endif()
+endif()
+set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
+set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
+set(SDL_POWER OFF CACHE BOOL "" FORCE)
+set(SDL_FILESYSTEM OFF CACHE BOOL "" FORCE)
+set(SDL_LOCALE ON CACHE BOOL "" FORCE)
+set(SDL_FILE OFF CACHE BOOL "" FORCE)
+set(SDL_MISC OFF CACHE BOOL "" FORCE)
+set(SDL_DIALOG ON CACHE BOOL "" FORCE)
+set(SDL_TRAY OFF CACHE BOOL "" FORCE)
+set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
+
+
+set(SDL_OPENGL OFF CACHE BOOL "" FORCE)
+set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
+
+
+set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
+set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
+set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
+
+
+if(UNIX AND NOT APPLE AND NOT ANDROID)
+    set(SDL_X11               ON  CACHE BOOL "" FORCE)
+    set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
+    set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
+    set(SDL_ALSA_SHARED       ON  CACHE BOOL "" FORCE)
+    set(SDL_PULSEAUDIO        ON  CACHE BOOL "" FORCE)
+    set(SDL_PULSEAUDIO_SHARED ON  CACHE BOOL "" FORCE)
+    set(SDL_PIPEWIRE          ON  CACHE BOOL "" FORCE)
+    set(SDL_PIPEWIRE_SHARED   ON  CACHE BOOL "" FORCE)
+endif()
+
+add_subdirectory(sdl3)
+endif()  # NOT REXGLUE_PLATFORM_SWITCH
+
+
+if(REXGLUE_USE_D3D12)
+    add_library(dxc-headers INTERFACE)
+    target_include_directories(dxc-headers INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/dxc/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/dxc>)
+endif()
+
+
+if(REXGLUE_USE_VULKAN)
+
+    set(SPIRV_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(SPIRV_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    add_subdirectory(spirv-headers)
+
+    add_library(spirv-tools-headers INTERFACE)
+    target_include_directories(spirv-tools-headers SYSTEM INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/spirv-tools/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
+    if(NOT REXGLUE_RUNTIME_ONLY)
+
+    set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+    set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+    set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+    set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(SKIP_GLSLANG_INSTALL ON CACHE BOOL "" FORCE)
+
+    set(ENABLE_RTTI ON CACHE BOOL "" FORCE)
+
+
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+    if(REXGLUE_PLATFORM_SWITCH)
+
+
+        set(UNIX 1)
+    endif()
+    add_subdirectory(glslang)
+    if(REXGLUE_PLATFORM_SWITCH)
+        unset(UNIX)
+    endif()
+
+    if(NOT TARGET glslang::SPIRV)
+        add_library(glslang::SPIRV ALIAS SPIRV)
+    endif()
+    endif()
+endif()
+
+
+if(REXGLUE_BUILD_TESTS)
+    add_subdirectory(catch2)
+endif()
+
+
+if(REXGLUE_ENABLE_TRACY)
+    set(TRACY_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/tracy)
+    set(TRACY_PUBLIC_DIR ${TRACY_ROOT}/public)
+
+    find_package(Threads REQUIRED)
+
+    add_library(TracyClient SHARED ${TRACY_PUBLIC_DIR}/TracyClient.cpp)
+    add_library(Tracy::TracyClient ALIAS TracyClient)
+
+    target_compile_features(TracyClient PUBLIC cxx_std_11)
+
+    target_include_directories(TracyClient SYSTEM PUBLIC
+        $<BUILD_INTERFACE:${TRACY_PUBLIC_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/tracy>
+    )
+
+    target_link_libraries(TracyClient PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+
+    if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_link_libraries(TracyClient PUBLIC ws2_32 dbghelp)
+    endif()
+
+    target_compile_definitions(TracyClient
+        PRIVATE
+            TRACY_EXPORTS
+        PUBLIC
+            TRACY_IMPORTS
+            TRACY_ENABLE
+            TRACY_ON_DEMAND
+            TRACY_DELAYED_INIT
+            TRACY_MANUAL_LIFETIME
+            TRACY_FIBERS
+    )
+
+    target_compile_options(TracyClient PRIVATE -w)
+
+    install(DIRECTORY ${TRACY_PUBLIC_DIR}/tracy
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tracy
+            FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h" PATTERN "*.hmm")
+    install(DIRECTORY ${TRACY_PUBLIC_DIR}/client
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tracy
+            FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h")
+    install(DIRECTORY ${TRACY_PUBLIC_DIR}/common
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tracy
+            FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h")
+endif()
+
+
+set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
+
+
+set(FFMPEG_OVERLAY_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-overlay")
+set(FFMPEG_OVERLAY_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-overlay")
+file(MAKE_DIRECTORY "${FFMPEG_OVERLAY_BUILD_DIR}/libavcodec")
+configure_file(
+  "${FFMPEG_OVERLAY_SRC_DIR}/codec_list.c" "${FFMPEG_OVERLAY_BUILD_DIR}/libavcodec/codec_list.c"
+  COPYONLY
+)
+configure_file(
+  "${FFMPEG_OVERLAY_SRC_DIR}/parser_list.c" "${FFMPEG_OVERLAY_BUILD_DIR}/libavcodec/parser_list.c"
+  COPYONLY
+)
+configure_file(
+  "${FFMPEG_OVERLAY_SRC_DIR}/bsf_list.c" "${FFMPEG_OVERLAY_BUILD_DIR}/libavcodec/bsf_list.c"
+  COPYONLY
+)
+
+
+set(FFMPEG_COMMON_DEFINES
+    HAVE_AV_CONFIG_H
+    _USE_MATH_DEFINES  # For M_PI/etc
+)
+
+
+if(WIN32)
+    set(FFMPEG_ATOMICS_INCLUDE "${FFMPEG_DIR}/compat/atomics/win32")
+else()
+    set(FFMPEG_ATOMICS_INCLUDE "${FFMPEG_DIR}/compat/atomics/gcc")
+endif()
+
+
+if(IS_ARM64)
+  enable_language(ASM)
+  set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv8-a")
+endif()
+
+
+add_library(libavutil STATIC
+    ${FFMPEG_DIR}/libavutil/adler32.c
+    ${FFMPEG_DIR}/libavutil/aes.c
+    ${FFMPEG_DIR}/libavutil/aes_ctr.c
+    ${FFMPEG_DIR}/libavutil/audio_fifo.c
+    ${FFMPEG_DIR}/libavutil/avstring.c
+    ${FFMPEG_DIR}/libavutil/avsscanf.c
+    ${FFMPEG_DIR}/libavutil/base64.c
+    ${FFMPEG_DIR}/libavutil/blowfish.c
+    ${FFMPEG_DIR}/libavutil/bprint.c
+    ${FFMPEG_DIR}/libavutil/buffer.c
+    ${FFMPEG_DIR}/libavutil/cast5.c
+    ${FFMPEG_DIR}/libavutil/camellia.c
+    ${FFMPEG_DIR}/libavutil/channel_layout.c
+    ${FFMPEG_DIR}/libavutil/color_utils.c
+    ${FFMPEG_DIR}/libavutil/cpu.c
+    ${FFMPEG_DIR}/libavutil/crc.c
+    ${FFMPEG_DIR}/libavutil/des.c
+    ${FFMPEG_DIR}/libavutil/dict.c
+    ${FFMPEG_DIR}/libavutil/display.c
+    ${FFMPEG_DIR}/libavutil/dovi_meta.c
+    ${FFMPEG_DIR}/libavutil/downmix_info.c
+    ${FFMPEG_DIR}/libavutil/encryption_info.c
+    ${FFMPEG_DIR}/libavutil/error.c
+    ${FFMPEG_DIR}/libavutil/eval.c
+    ${FFMPEG_DIR}/libavutil/fifo.c
+    ${FFMPEG_DIR}/libavutil/file.c
+    ${FFMPEG_DIR}/libavutil/file_open.c
+    ${FFMPEG_DIR}/libavutil/float_dsp.c
+    ${FFMPEG_DIR}/libavutil/fixed_dsp.c
+    ${FFMPEG_DIR}/libavutil/frame.c
+    ${FFMPEG_DIR}/libavutil/hash.c
+    ${FFMPEG_DIR}/libavutil/hdr_dynamic_metadata.c
+    ${FFMPEG_DIR}/libavutil/hmac.c
+    ${FFMPEG_DIR}/libavutil/hwcontext.c
+    ${FFMPEG_DIR}/libavutil/imgutils.c
+    ${FFMPEG_DIR}/libavutil/integer.c
+    ${FFMPEG_DIR}/libavutil/intmath.c
+    ${FFMPEG_DIR}/libavutil/lfg.c
+    ${FFMPEG_DIR}/libavutil/lls.c
+    ${FFMPEG_DIR}/libavutil/log.c
+    ${FFMPEG_DIR}/libavutil/log2_tab.c
+    ${FFMPEG_DIR}/libavutil/mathematics.c
+    ${FFMPEG_DIR}/libavutil/mastering_display_metadata.c
+    ${FFMPEG_DIR}/libavutil/md5.c
+    ${FFMPEG_DIR}/libavutil/mem.c
+    ${FFMPEG_DIR}/libavutil/murmur3.c
+    ${FFMPEG_DIR}/libavutil/opt.c
+    ${FFMPEG_DIR}/libavutil/parseutils.c
+    ${FFMPEG_DIR}/libavutil/pixdesc.c
+    ${FFMPEG_DIR}/libavutil/pixelutils.c
+    ${FFMPEG_DIR}/libavutil/random_seed.c
+    ${FFMPEG_DIR}/libavutil/rational.c
+    ${FFMPEG_DIR}/libavutil/reverse.c
+    ${FFMPEG_DIR}/libavutil/rc4.c
+    ${FFMPEG_DIR}/libavutil/ripemd.c
+    ${FFMPEG_DIR}/libavutil/samplefmt.c
+    ${FFMPEG_DIR}/libavutil/sha.c
+    ${FFMPEG_DIR}/libavutil/sha512.c
+    ${FFMPEG_DIR}/libavutil/slicethread.c
+    ${FFMPEG_DIR}/libavutil/spherical.c
+    ${FFMPEG_DIR}/libavutil/stereo3d.c
+    ${FFMPEG_DIR}/libavutil/threadmessage.c
+    ${FFMPEG_DIR}/libavutil/time.c
+    ${FFMPEG_DIR}/libavutil/timecode.c
+    ${FFMPEG_DIR}/libavutil/tree.c
+    ${FFMPEG_DIR}/libavutil/twofish.c
+    ${FFMPEG_DIR}/libavutil/utils.c
+    ${FFMPEG_DIR}/libavutil/xga_font_data.c
+    ${FFMPEG_DIR}/libavutil/xtea.c
+    ${FFMPEG_DIR}/libavutil/tea.c
+    ${FFMPEG_DIR}/libavutil/tx.c
+    ${FFMPEG_DIR}/libavutil/tx_float.c
+    ${FFMPEG_DIR}/libavutil/tx_double.c
+    ${FFMPEG_DIR}/libavutil/tx_int32.c
+    ${FFMPEG_DIR}/libavutil/video_enc_params.c
+    ${FFMPEG_DIR}/libavutil/film_grain_params.c
+)
+
+
+if(IS_X86_64)
+    target_sources(libavutil PRIVATE
+        ${FFMPEG_DIR}/libavutil/x86/cpu.c
+        ${FFMPEG_DIR}/libavutil/x86/fixed_dsp_init.c
+        ${FFMPEG_DIR}/libavutil/x86/float_dsp_init.c
+        ${FFMPEG_DIR}/libavutil/x86/imgutils_init.c
+        ${FFMPEG_DIR}/libavutil/x86/lls_init.c
+    )
+endif()
+
+
+if(IS_ARM64)
+    target_sources(libavutil PRIVATE
+        ${FFMPEG_DIR}/libavutil/aarch64/cpu.c
+        ${FFMPEG_DIR}/libavutil/aarch64/float_dsp_init.c
+        ${FFMPEG_DIR}/libavutil/aarch64/float_dsp_neon.S
+    )
+    target_compile_definitions(libavutil PRIVATE
+        HAVE_NEON=1
+        HAVE_ARMV8=1
+        HAVE_INLINE_ASM=1
+    )
+endif()
+
+target_include_directories(libavutil
+    PUBLIC
+        $<BUILD_INTERFACE:${FFMPEG_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
+)
+target_compile_definitions(libavutil PRIVATE ${FFMPEG_COMMON_DEFINES})
+target_compile_options(libavutil PRIVATE -w)  # Suppress warnings in third-party code
+if(WIN32)
+    target_link_libraries(libavutil PRIVATE bcrypt)
+endif()
+
+
+add_library(libavcodec STATIC
+    ${FFMPEG_DIR}/libavcodec/ac3_parser.c
+    ${FFMPEG_DIR}/libavcodec/adts_parser.c
+    ${FFMPEG_DIR}/libavcodec/allcodecs.c
+    ${FFMPEG_DIR}/libavcodec/avcodec.c
+    ${FFMPEG_DIR}/libavcodec/avdct.c
+    ${FFMPEG_DIR}/libavcodec/avpacket.c
+    ${FFMPEG_DIR}/libavcodec/avpicture.c
+    ${FFMPEG_DIR}/libavcodec/bitstream.c
+    ${FFMPEG_DIR}/libavcodec/bitstream_filter.c
+    ${FFMPEG_DIR}/libavcodec/bitstream_filters.c
+    ${FFMPEG_DIR}/libavcodec/bsf.c
+    ${FFMPEG_DIR}/libavcodec/codec_desc.c
+    ${FFMPEG_DIR}/libavcodec/codec_par.c
+    ${FFMPEG_DIR}/libavcodec/d3d11va.c
+    ${FFMPEG_DIR}/libavcodec/decode.c
+    ${FFMPEG_DIR}/libavcodec/dirac.c
+    ${FFMPEG_DIR}/libavcodec/dv_profile.c
+    ${FFMPEG_DIR}/libavcodec/encode.c
+    ${FFMPEG_DIR}/libavcodec/imgconvert.c
+    ${FFMPEG_DIR}/libavcodec/jni.c
+    ${FFMPEG_DIR}/libavcodec/mathtables.c
+    ${FFMPEG_DIR}/libavcodec/mediacodec.c
+    ${FFMPEG_DIR}/libavcodec/mpeg12framerate.c
+    ${FFMPEG_DIR}/libavcodec/options.c
+    ${FFMPEG_DIR}/libavcodec/parser.c
+    ${FFMPEG_DIR}/libavcodec/parsers.c
+    ${FFMPEG_DIR}/libavcodec/profiles.c
+    ${FFMPEG_DIR}/libavcodec/qsv_api.c
+    ${FFMPEG_DIR}/libavcodec/raw.c
+    ${FFMPEG_DIR}/libavcodec/utils.c
+    ${FFMPEG_DIR}/libavcodec/vorbis_parser.c
+    ${FFMPEG_DIR}/libavcodec/xiph.c
+    ${FFMPEG_DIR}/libavcodec/faandct.c
+    ${FFMPEG_DIR}/libavcodec/faanidct.c
+    ${FFMPEG_DIR}/libavcodec/fdctdsp.c
+    ${FFMPEG_DIR}/libavcodec/jfdctfst.c
+    ${FFMPEG_DIR}/libavcodec/jfdctint.c
+    ${FFMPEG_DIR}/libavcodec/idctdsp.c
+    ${FFMPEG_DIR}/libavcodec/simple_idct.c
+    ${FFMPEG_DIR}/libavcodec/jrevdct.c
+    ${FFMPEG_DIR}/libavcodec/mdct_float.c
+    ${FFMPEG_DIR}/libavcodec/mdct_fixed_32.c
+    ${FFMPEG_DIR}/libavcodec/sinewin.c
+    ${FFMPEG_DIR}/libavcodec/wma_freqs.c
+    ${FFMPEG_DIR}/libavcodec/wmaprodec.c
+    ${FFMPEG_DIR}/libavcodec/wmadec.c
+    ${FFMPEG_DIR}/libavcodec/wma.c
+    ${FFMPEG_DIR}/libavcodec/wma_common.c
+    ${FFMPEG_DIR}/libavcodec/mpegaudio.c
+    ${FFMPEG_DIR}/libavcodec/mpegaudiodata.c
+    ${FFMPEG_DIR}/libavcodec/mpegaudiodecheader.c
+    ${FFMPEG_DIR}/libavcodec/mpegaudiodec_common.c
+    ${FFMPEG_DIR}/libavcodec/mpegaudiodec_float.c
+    ${FFMPEG_DIR}/libavcodec/mpegaudiodec_fixed.c
+    ${FFMPEG_DIR}/libavcodec/mpegaudiodsp.c
+    ${FFMPEG_DIR}/libavcodec/mpegaudiodsp_data.c
+    ${FFMPEG_DIR}/libavcodec/mpegaudiodsp_float.c
+    ${FFMPEG_DIR}/libavcodec/mpegaudiodsp_fixed.c
+    ${FFMPEG_DIR}/libavcodec/mpegaudio_parser.c
+    ${FFMPEG_DIR}/libavcodec/dct.c
+    ${FFMPEG_DIR}/libavcodec/dct32_float.c
+    ${FFMPEG_DIR}/libavcodec/dct32_fixed.c
+    ${FFMPEG_DIR}/libavcodec/rdft.c
+    ${FFMPEG_DIR}/libavcodec/aactab.c
+    ${FFMPEG_DIR}/libavcodec/null_bsf.c
+    ${FFMPEG_DIR}/libavcodec/pthread.c
+    ${FFMPEG_DIR}/libavcodec/pthread_slice.c
+    ${FFMPEG_DIR}/libavcodec/pthread_frame.c
+    ${FFMPEG_DIR}/libavcodec/avfft.c
+    ${FFMPEG_DIR}/libavcodec/fft_float.c
+    ${FFMPEG_DIR}/libavcodec/fft_fixed_32.c
+    ${FFMPEG_DIR}/libavcodec/fft_init_table.c
+
+    ${FFMPEG_DIR}/libavcodec/vc1dec.c
+    ${FFMPEG_DIR}/libavcodec/vc1_block.c
+    ${FFMPEG_DIR}/libavcodec/vc1_loopfilter.c
+    ${FFMPEG_DIR}/libavcodec/vc1_mc.c
+    ${FFMPEG_DIR}/libavcodec/vc1_pred.c
+    ${FFMPEG_DIR}/libavcodec/vc1.c
+    ${FFMPEG_DIR}/libavcodec/vc1data.c
+    ${FFMPEG_DIR}/libavcodec/vc1dsp.c
+    ${FFMPEG_DIR}/libavcodec/msmpeg4dec.c
+    ${FFMPEG_DIR}/libavcodec/msmpeg4.c
+    ${FFMPEG_DIR}/libavcodec/msmpeg4data.c
+    ${FFMPEG_DIR}/libavcodec/wmv2dsp.c
+    ${FFMPEG_DIR}/libavcodec/wmv2data.c
+    ${FFMPEG_DIR}/libavcodec/h263dec.c
+    ${FFMPEG_DIR}/libavcodec/h263.c
+    ${FFMPEG_DIR}/libavcodec/ituh263dec.c
+    ${FFMPEG_DIR}/libavcodec/mpeg4video.c
+    ${FFMPEG_DIR}/libavcodec/mpeg4videodec.c
+    ${FFMPEG_DIR}/libavcodec/h263data.c
+    ${FFMPEG_DIR}/libavcodec/h263_parser.c
+    ${FFMPEG_DIR}/libavcodec/h263dsp.c
+    ${FFMPEG_DIR}/libavcodec/mpegvideo.c
+    ${FFMPEG_DIR}/libavcodec/mpegvideodsp.c
+    ${FFMPEG_DIR}/libavcodec/rl.c
+    ${FFMPEG_DIR}/libavcodec/mpegvideo_motion.c
+    ${FFMPEG_DIR}/libavcodec/mpegutils.c
+    ${FFMPEG_DIR}/libavcodec/mpegvideodata.c
+    ${FFMPEG_DIR}/libavcodec/mpegpicture.c
+    ${FFMPEG_DIR}/libavcodec/mpeg_er.c
+    ${FFMPEG_DIR}/libavcodec/error_resilience.c
+    ${FFMPEG_DIR}/libavcodec/qpeldsp.c
+    ${FFMPEG_DIR}/libavcodec/blockdsp.c
+    ${FFMPEG_DIR}/libavcodec/h264qpel.c
+    ${FFMPEG_DIR}/libavcodec/intrax8.c
+    ${FFMPEG_DIR}/libavcodec/intrax8dsp.c
+    ${FFMPEG_DIR}/libavcodec/h264chroma.c
+    ${FFMPEG_DIR}/libavcodec/hpeldsp.c
+    ${FFMPEG_DIR}/libavcodec/me_cmp.c
+    ${FFMPEG_DIR}/libavcodec/videodsp.c
+    ${FFMPEG_DIR}/libavcodec/pixblockdsp.c
+    ${FFMPEG_DIR}/libavcodec/startcode.c
+
+    ${FFMPEG_DIR}/libavcodec/vp8.c
+    ${FFMPEG_DIR}/libavcodec/vp56rac.c
+    ${FFMPEG_DIR}/libavcodec/vp8dsp.c
+    ${FFMPEG_DIR}/libavcodec/h264pred.c
+)
+
+
+if(WIN32)
+    target_sources(libavcodec PRIVATE
+        ${FFMPEG_DIR}/libavcodec/file_open.c
+    )
+endif()
+
+
+if(IS_X86_64)
+    target_sources(libavcodec PRIVATE
+        ${FFMPEG_DIR}/libavcodec/x86/constants.c
+        ${FFMPEG_DIR}/libavcodec/x86/fdctdsp_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/fft_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/idctdsp_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/fdct.c
+        ${FFMPEG_DIR}/libavcodec/x86/mpegaudiodsp.c
+        ${FFMPEG_DIR}/libavcodec/x86/dct_init.c
+
+        ${FFMPEG_DIR}/libavcodec/x86/blockdsp_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/h263dsp_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/h264chroma_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/h264_qpel.c
+        ${FFMPEG_DIR}/libavcodec/x86/hpeldsp_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/me_cmp_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/mpegvideo.c
+        ${FFMPEG_DIR}/libavcodec/x86/mpegvideodsp.c
+        ${FFMPEG_DIR}/libavcodec/x86/pixblockdsp_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/qpeldsp_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/vc1dsp_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/videodsp_init.c
+
+        ${FFMPEG_DIR}/libavcodec/x86/vp8dsp_init.c
+        ${FFMPEG_DIR}/libavcodec/x86/h264_intrapred_init.c
+    )
+endif()
+
+
+if(IS_ARM64)
+    target_sources(libavcodec PRIVATE
+        ${FFMPEG_DIR}/libavcodec/aarch64/fft_init_aarch64.c
+        ${FFMPEG_DIR}/libavcodec/aarch64/fft_neon.S
+        ${FFMPEG_DIR}/libavcodec/aarch64/mdct_neon.S
+        ${FFMPEG_DIR}/libavcodec/aarch64/simple_idct_neon.S
+        ${FFMPEG_DIR}/libavcodec/aarch64/videodsp.S
+        ${FFMPEG_DIR}/libavcodec/aarch64/neon.S
+        ${FFMPEG_DIR}/libavcodec/aarch64/mpegaudiodsp_init.c
+        ${FFMPEG_DIR}/libavcodec/aarch64/mpegaudiodsp_neon.S
+
+        ${FFMPEG_DIR}/libavcodec/aarch64/h264chroma_init_aarch64.c
+        ${FFMPEG_DIR}/libavcodec/aarch64/h264cmc_neon.S
+        ${FFMPEG_DIR}/libavcodec/aarch64/h264qpel_init_aarch64.c
+        ${FFMPEG_DIR}/libavcodec/aarch64/h264qpel_neon.S
+        ${FFMPEG_DIR}/libavcodec/aarch64/hpeldsp_init_aarch64.c
+        ${FFMPEG_DIR}/libavcodec/aarch64/hpeldsp_neon.S
+        ${FFMPEG_DIR}/libavcodec/aarch64/idctdsp_init_aarch64.c
+        ${FFMPEG_DIR}/libavcodec/aarch64/pixblockdsp_init_aarch64.c
+        ${FFMPEG_DIR}/libavcodec/aarch64/pixblockdsp_neon.S
+        ${FFMPEG_DIR}/libavcodec/aarch64/videodsp_init.c
+        ${FFMPEG_DIR}/libavcodec/aarch64/vc1dsp_init_aarch64.c
+        ${FFMPEG_DIR}/libavcodec/neon/mpegvideo.c
+
+        ${FFMPEG_DIR}/libavcodec/aarch64/vp8dsp_init_aarch64.c
+        ${FFMPEG_DIR}/libavcodec/aarch64/vp8dsp_neon.S
+        ${FFMPEG_DIR}/libavcodec/aarch64/h264pred_init.c
+        ${FFMPEG_DIR}/libavcodec/aarch64/h264pred_neon.S
+    )
+    target_compile_definitions(libavcodec PRIVATE
+        HAVE_NEON=1
+        HAVE_ARMV8=1
+        HAVE_INLINE_ASM=1
+    )
+endif()
+
+target_include_directories(libavcodec BEFORE PRIVATE "${FFMPEG_OVERLAY_BUILD_DIR}")
+
+target_include_directories(libavcodec
+    PUBLIC
+        $<BUILD_INTERFACE:${FFMPEG_DIR}>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
+)
+target_compile_definitions(libavcodec PRIVATE ${FFMPEG_COMMON_DEFINES})
+target_compile_options(libavcodec PRIVATE -w)  # Suppress warnings in third-party code
+target_link_libraries(libavcodec PUBLIC libavutil)
+if(WIN32)
+    target_link_libraries(libavcodec PRIVATE bcrypt)
+endif()
+
+
+set_target_properties(libavutil libavcodec PROPERTIES
+    C_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+    FOLDER "FFmpeg")

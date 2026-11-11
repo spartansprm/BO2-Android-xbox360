@@ -1,0 +1,12 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Preserve the upstream SDL license text, including its original spacing.
+android/app/src/main/assets/licenses/SDL3.txt -whitespace
+android/app/src/main/assets/licenses/Crypto-DES-MIT.txt -whitespace
+android/app/src/main/assets/licenses/Crypto-notices.txt -whitespace
+android/app/src/main/assets/licenses/libmspack-LGPL-2.1.txt -whitespace
+
+# Preserve this third-party license exactly as published upstream.
+android/app/src/main/assets/licenses/SPIRV-Headers-MIT.txt -whitespace

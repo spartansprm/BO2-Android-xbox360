@@ -1,0 +1,81 @@
+# Game data and anything derived from it: never commit
+/game/
+work/
+generated/
+**/generated/
+/app/codegen_gaps.txt
+/campaign/codegen_gaps.txt
+*.xex
+*.xexp
+*.pe
+*.bin
+*.ff
+*.ipak
+*.sabl
+*.sabs
+*.bik
+*.webm
+*.spvpack
+*.gscpack
+*.spvidx
+*.dksh
+shader_library/
+
+# Upstream reference checkouts (rebuilt by tools/build_host.sh)
+refs/
+
+# SDK third-party sources: fetched from the official ReXGlue SDK v0.10.0 submodules by tools/fetch_thirdparty.py.
+# Tracked dependency configuration is retained.
+/sdk/thirdparty/*
+!/sdk/thirdparty/CMakeLists.txt
+
+# Build outputs
+out/
+build/
+dist/
+.venv/
+.env
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.pem
+*.idsig
+/core
+/core.[0-9]*
+*.dmp
+*.nro
+*.nso
+*.nsp
+*.elf
+*.gcda
+*.obj
+*.exe
+*.dll
+
+# Logs (local paths, per-run data)
+*.log
+app/logs/
+
+# Ghidra / REA local state
+*.gpr
+*.rep/
+*.lock
+.rea/
+
+# Python
+__pycache__/
+
+# This machine's data folder (tools/data_dir.sh) and the default one
+/bo2_data.txt
+/data/
+
+# Android diagnostic dependencies, local SDK paths and outputs
+/android/.gradle/
+/android/.cxx/
+/android/local.properties
+/android/sdl3/
+/android/app/.cxx/
+/android/app/build/
+*.apk
+*.aab

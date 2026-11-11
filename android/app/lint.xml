@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+
+
+    <issue id="MissingPermission">
+        <ignore path="../sdl3/android-project/app/src/main/java/org/libsdl/app/HIDDeviceBLESteamController.java" />
+        <ignore path="../sdl3/android-project/app/src/main/java/org/libsdl/app/HIDDeviceManager.java" />
+        <ignore path="../sdl3/android-project/app/src/main/java/org/libsdl/app/SDLControllerManager.java" />
+    </issue>
+    <issue id="NewApi">
+        <ignore path="../sdl3/android-project/app/src/main/java/org/libsdl/app/SDLControllerManager.java" />
+    </issue>
+    <issue id="UnspecifiedRegisterReceiverFlag">
+        <ignore path="../sdl3/android-project/app/src/main/java/org/libsdl/app/HIDDeviceManager.java" />
+    </issue>
+</lint>
