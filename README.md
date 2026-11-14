@@ -61,7 +61,7 @@ para abrir el menú de controles o salir.
 - **Biblioteca de shaders**: importa shaders ya preparados para evitar los tirones iniciales.
 - **Driver de GPU** *(solo Adreno / Snapdragon)*: carga un driver gráfico como **Mesa Turnip** o un driver de Qualcomm
   actualizado, en un ZIP como los de los emuladores. Sirve para teléfonos con drivers antiguos o con fallos (pantalla
-  negra, partes sin dibujar). No necesita root ni toca el sistema; si el driver no funciona, el juego vuelve solo al del
+  negra, partes sin dibujar). Si el driver no funciona, el juego vuelve solo al del
   sistema.
 - **Guardar registro de la última partida**: crea un ZIP con el registro del juego y los datos de tu GPU para enviarlo
   si tienes un problema.
