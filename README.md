@@ -54,7 +54,7 @@ para abrir el menú de controles o salir.
 | Calidad del escenario | La del menú del juego, Baja, Media o Alta (como Xbox 360) |
 | Filtrado anisotrópico | El del juego (2×–4×), 4× u 8× |
 | Memoria para texturas *(experimental)* | 384 MB, 768 MB o 1 GB. Subirla reduce las caídas bruscas de FPS si tu teléfono tiene RAM de sobra |
-| Preparar shaders antes de jugar | Desactivado por defecto. Activado, la primera vez en cada mapa espera en una pantalla de progreso (usa todos los núcleos) y luego se ve bien desde el principio |
+| Preparar shaders antes de jugar | Desactivado por defecto. Activado, la primera vez en cada mapa espera en una pantalla de progreso, así evitas tirones en celulares de gama media-baja |
 
 **Biblioteca**:
 
