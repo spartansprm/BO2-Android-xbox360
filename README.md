@@ -28,7 +28,7 @@ Al abrir la app por primera vez, el lanzador pide la carpeta del juego: la que c
 ## Del teléfono
 
 - Android 9 o superior, **ARM64**, con CPU **ARMv8.2** o más nueva (Snapdragon 845, Exynos 990, Helio G90, Dimensity
-  o posteriores). Los procesadores más antiguos (Snapdragon 835 o anteriores) no pueden ejecutarlo.
+  o posteriores).
 - **Vulkan 1.2**, o **Vulkan 1.1** con las extensiones `VK_EXT_descriptor_indexing`, `VK_EXT_scalar_block_layout`,
   `VK_KHR_uniform_buffer_standard_layout` y `VK_KHR_sampler_mirror_clamp_to_edge`.
 
