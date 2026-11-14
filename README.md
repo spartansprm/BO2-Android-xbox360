@@ -13,8 +13,7 @@ del juego; este repositorio no contiene datos del juego.
 
 ## Del juego
 
-Tu copia de **Black Ops II de Xbox 360** con el **Title Update 18** (title id `415608C3`, versión `0.0.18.14`). Otras
-versiones no sirven.
+Tu copia de **Black Ops II de Xbox 360** con el **Title Update 18** (title id `415608C3`, versión `0.0.18.14`).
 
 Al abrir la app por primera vez, el lanzador pide la carpeta del juego: la que contiene estas carpetas de tu copia:
 
