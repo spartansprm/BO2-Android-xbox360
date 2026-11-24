@@ -1,7 +1,7 @@
 # Black Ops II para Android
 
 Port nativo de **Call of Duty: Black Ops II (2012, Xbox 360)** a Android ARM64, con Campaña, Zombies y Multijugador,
-controles táctiles (o mando) y renderizador Vulkan. Versión **0.63.0 (beta)**.
+controles táctiles (o mando) y renderizador Vulkan. Versión **0.65.0 (beta)**.
 
 No es un emulador: el código PowerPC del juego se traduce a C++ y se ejecuta de forma nativa. Necesitas tu propia copia
 del juego; este repositorio no contiene datos del juego.
